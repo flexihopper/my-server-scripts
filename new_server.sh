@@ -71,6 +71,29 @@ echo "🛡️ Сервер SSH настроен: вход по паролю и �
 
 # === Настройка Firewall (UFW) ===
 echo "🔥 Настройка файрвола UFW..."
+# Проверка прав root
+if [[ $EUID -ne 0 ]]; then
+   echo "Запустите скрипт с sudo: sudo bash $0"
+   exit 1
+fi
+
+UFW_FILE="/etc/default/ufw"
+BACKUP_FILE="${UFW_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
+
+echo "Создаём бэкап UFW-конфига..."
+cp "$UFW_FILE" "$BACKUP_FILE"
+echo "Бэкап сохранён: $BACKUP_FILE"
+
+# Устанавливаем IPV6=no в файле
+if grep -q "^IPV6=no$" "$UFW_FILE"; then
+    echo "IPv6 уже отключён в UFW."
+else
+    sed -i 's/^IPV6=.*/IPV6=no/' "$UFW_FILE"
+    if ! grep -q "^IPV6=" "$UFW_FILE"; then
+        echo "IPV6=no" >> "$UFW_FILE"
+    fi
+    echo "Установлено IPV6=no в $UFW_FILE."
+fi
 ufw allow $SSH_PORT/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
