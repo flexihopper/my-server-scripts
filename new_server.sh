@@ -57,17 +57,21 @@ fi
 
 # === Настройка SSH ===
 echo "🔐 Настройка безопасного доступа по SSH..."
-mkdir -p /home/$NEW_USER/.ssh
-chmod 700 /home/$NEW_USER/.ssh
+#mkdir -p /home/$NEW_USER/.ssh
+#touch /home/www/.ssh/authorized_keys
+#chown -R www:www /home/www/.ssh
+#chmod 700 /home/$NEW_USER/.ssh
+#chmod 600 /home/www/.ssh/authorized_keys
+# надо доработать. созать папку юыыр
 
 # Настройка конфигурации SSHD
 sed -i "s/#Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 sed -i "s/PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
-sed -i "s/#PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
-sed -i "s/PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config # Дополнительно для уже раскомментированных строк
+#sed -i "s/#PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
+#sed -i "s/PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config # Дополнительно для уже раскомментированных строк
 
 systemctl reload ssh
-echo "🛡️ Сервер SSH настроен: вход по паролю и для root отключен, порт изменен на $SSH_PORT."
+echo "🛡️ Сервер SSH настроен: вход под root отключен, порт изменен на $SSH_PORT."
 
 # === Настройка Firewall (UFW) ===
 echo "🔥 Настройка файрвола UFW..."
@@ -108,12 +112,17 @@ echo "✅ Fail2Ban настроен и запущен."
 
 # === Финальное сообщение ===
 echo ""
+echo " Задай пароль для $NEW_USER:"
+passwd $NEW_USER
 echo "🎉 === Настройка сервера успешно завершена! === 🎉"
 SERVER_IP=$(hostname -I | awk '{print $1}')
 echo "Не забудьте проверить лог выполнения в файле: /var/log/server-setup.log"
+echo "Скопируй SSH ключ на сервер:"
+echo "ssh-copy-id -p $SSH_PORT $NEW_USER@$SERVER_IP"
 echo "Для подключения используйте команду:"
 echo "ssh -p $SSH_PORT $NEW_USER@$SERVER_IP"
-echo "Задай пароль для $NEW_USER:"
-echo "passwd $NEW_USER"
-echo "Скопируй SSH ключ на сервер:"
-echo "ssh-copy-id $NEW_USER@$SERVER_IP"
+echo "Отключи вход по паролю!"
+echo "sudo su"
+echo "vim /etc/ssh/sshd_config"
+echo "PasswordAuthentication no"
+echo "reboot"
