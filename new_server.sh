@@ -61,6 +61,7 @@ echo "🔐 Настройка безопасного доступа по SSH..."
 # Настройка конфигурации SSHD
 sed -i "s/#Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 sed -i "s/PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
+# Чтобы локали нормально работали
 sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
 systemctl restart sshd
 echo "🛡️ Сервер SSH настроен: вход под root отключен, порт изменен на $SSH_PORT."
