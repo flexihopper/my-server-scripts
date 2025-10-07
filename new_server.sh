@@ -57,25 +57,12 @@ fi
 
 # === Настройка SSH ===
 echo "🔐 Настройка безопасного доступа по SSH..."
-#mkdir -p /home/$NEW_USER/.ssh
-#touch /home/www/.ssh/authorized_keys
-#chown -R www:www /home/www/.ssh
-#chmod 700 /home/$NEW_USER/.ssh
-#chmod 600 /home/www/.ssh/authorized_keys
-# надо доработать. созать папку юыыр
 
 # Настройка конфигурации SSHD
-systemctl disable ssh.service
-systemctl stop ssh
-pkill -f /usr/sbin/sshd
 sed -i "s/#Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 sed -i "s/PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
-#sed -i "s/#PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
-#sed -i "s/PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config # Дополнительно для уже раскомментированных строк
-
-systemctl restart ssh.socket
-
-
+sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
+systemctl restart sshd
 echo "🛡️ Сервер SSH настроен: вход под root отключен, порт изменен на $SSH_PORT."
 
 # === Настройка Firewall (UFW) ===
