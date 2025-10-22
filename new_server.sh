@@ -60,19 +60,20 @@ echo "🔐 Настройка безопасного доступа по SSH..."
 
 # Настройка конфигурации SSHD
 sed -i "s/#Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
-sed -i "s/PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
+sed -i "s/.*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config  # Если уже раскомментирован
+sed -i "s/.*PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
+sed -i "s/.*PasswordAuthentication .*/PasswordAuthentication yes/" /etc/ssh/sshd_config  # Временно
+sed -i "s/.*PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
+sed -i "s/.*PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
+sed -i "s/.*MaxAuthTries .*/MaxAuthTries 3/" /etc/ssh/sshd_config
+sed -i "s/.*X11Forwarding .*/X11Forwarding no/" /etc/ssh/sshd_config
 # Чтобы локали нормально работали
 sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
-systemctl restart sshd
+systemctl restart ssh
 echo "🛡️ Сервер SSH настроен: вход под root отключен, порт изменен на $SSH_PORT."
 
 # === Настройка Firewall (UFW) ===
 echo "🔥 Настройка файрвола UFW..."
-# Проверка прав root
-if [[ $EUID -ne 0 ]]; then
-   echo "Запустите скрипт с sudo: sudo bash $0"
-   exit 1
-fi
 
 UFW_FILE="/etc/default/ufw"
 BACKUP_FILE="${UFW_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
@@ -114,8 +115,21 @@ echo "Скопируй SSH ключ на сервер:"
 echo "ssh-copy-id -p $SSH_PORT $NEW_USER@$SERVER_IP"
 echo "Для подключения используйте команду:"
 echo "ssh -p $SSH_PORT $NEW_USER@$SERVER_IP"
-echo "Отключи вход по паролю!"
-echo "sudo su"
-echo "vim /etc/ssh/sshd_config"
-echo "PasswordAuthentication no"
-echo "reboot"
+echo ""
+echo "🔐 Хотите отключить парольную аутентификацию SSH? (рекомендуется после копирования ключа)"
+echo "Убедитесь, что вы скопировали SSH-ключ командой:"
+echo "  ssh-copy-id -p $SSH_PORT $NEW_USER@$SERVER_IP"
+echo ""
+read -p "Отключить вход по паролю? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    sed -i "s/.*PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
+    systemctl restart ssh
+    echo "✅ Парольная аутентификация отключена!"
+else
+    echo "⚠️  Парольная аутентификация оставлена включенной."
+    echo "Отключите её позже командой:"
+    echo "sudo sed -i 's/.*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config"
+    echo "sudo systemctl restart ssh"
+fi
+echo "🚀 Настройка завершена: $(date)"
