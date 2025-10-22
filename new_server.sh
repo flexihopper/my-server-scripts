@@ -47,6 +47,17 @@ if [ -n "$NEW_HOSTNAME" ]; then
 else
   echo "⏭️  Hostname не изменён."
 fi
+# === Настройка Docker ===
+read -p "Установить Docker? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "🐳 Установка Docker..."
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    usermod -aG docker $NEW_USER
+    systemctl enable docker
+    echo "✅ Docker установлен."
+fi
 
 # === Настройка часового пояса ===
 echo "🕒 Настройка часового пояса на $TIMEZONE..."
