@@ -35,6 +35,19 @@ apt install -y \
   fail2ban \
   build-essential
 
+# === Настройка hostname ===
+echo "🏷️  Текущий hostname: $(hostname)"
+read -p "Введите новый hostname (Enter для пропуска): " NEW_HOSTNAME
+
+if [ -n "$NEW_HOSTNAME" ]; then
+  hostnamectl set-hostname "$NEW_HOSTNAME"
+  sed -i "s/127.0.1.1.*/127.0.1.1       $NEW_HOSTNAME/" /etc/hosts
+  grep -q "127.0.1.1" /etc/hosts || echo "127.0.1.1       $NEW_HOSTNAME" >> /etc/hosts
+  echo "✅ Hostname изменён на: $NEW_HOSTNAME"
+else
+  echo "⏭️  Hostname не изменён."
+fi
+
 # === Настройка часового пояса ===
 echo "🕒 Настройка часового пояса на $TIMEZONE..."
 timedatectl set-timezone "$TIMEZONE"
