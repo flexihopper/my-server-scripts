@@ -82,7 +82,17 @@ sed -i "s/.*MaxAuthTries .*/MaxAuthTries 3/" /etc/ssh/sshd_config
 sed -i "s/.*X11Forwarding .*/X11Forwarding no/" /etc/ssh/sshd_config
 # Чтобы локали нормально работали
 sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
-systemctl restart ssh
+
+if systemctl list-units --type=service | grep -q "ssh.service"; then
+    SSH_SERVICE="ssh"
+elif systemctl list-units --type=service | grep -q "sshd.service"; then
+    SSH_SERVICE="sshd"
+else
+    echo "❌ SSH-сервис не найден!"
+    exit 1
+fi
+
+systemctl restart "$SSH_SERVICE"
 echo "🛡️ Сервер SSH настроен: вход под root отключен, порт изменен на $SSH_PORT."
 
 # === Настройка Firewall (UFW) ===
@@ -137,7 +147,7 @@ read -p "Отключить вход по паролю? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     sed -i "s/.*PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
-    systemctl restart ssh
+    systemctl restart "$SSH_SERVICE"
     echo "✅ Парольная аутентификация отключена!"
 else
     echo "⚠️  Парольная аутентификация оставлена включенной."
