@@ -63,6 +63,18 @@ fi
 echo "🕒 Настройка часового пояса на $TIMEZONE..."
 timedatectl set-timezone "$TIMEZONE"
 
+# === Настройка Docker ===
+read -p "Установить Docker? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "🐳 Установка Docker..."
+    curl -fsSL https://get.docker.com -o get-docker.sh
+    sh get-docker.sh
+    usermod -aG docker $NEW_USER
+    systemctl enable docker
+    echo "✅ Docker установлен."
+fi
+
 # === Установка свежей версии Python ===
 echo "🐍 Установка Python $PYTHON_VERSION из PPA deadsnakes..."
 add-apt-repository ppa:deadsnakes/ppa -y
