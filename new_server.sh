@@ -47,17 +47,6 @@ if [ -n "$NEW_HOSTNAME" ]; then
 else
   echo "⏭️  Hostname не изменён."
 fi
-# === Настройка Docker ===
-read -p "Установить Docker? (y/N): " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo "🐳 Установка Docker..."
-    curl -fsSL https://get.docker.com -o get-docker.sh
-    sh get-docker.sh
-    usermod -aG docker $NEW_USER
-    systemctl enable docker
-    echo "✅ Docker установлен."
-fi
 
 # === Настройка часового пояса ===
 echo "🕒 Настройка часового пояса на $TIMEZONE..."
@@ -76,11 +65,14 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
 fi
 
 # === Установка свежей версии Python ===
-echo "🐍 Установка Python $PYTHON_VERSION из PPA deadsnakes..."
-add-apt-repository ppa:deadsnakes/ppa -y
-apt update
-apt install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev
-
+read -p "Установить Python? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "🐍 Установка Python $PYTHON_VERSION из PPA deadsnakes..."
+    add-apt-repository ppa:deadsnakes/ppa -y
+    apt update
+    apt install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev
+fi
 # === Создание нового пользователя ===
 if ! id -u "$NEW_USER" >/dev/null 2>&1; then
   echo "👤 Создание нового пользователя '$NEW_USER'..."
