@@ -26,15 +26,28 @@ sysctl -w net.ipv6.conf.all.forwarding=1
 sysctl -w net.core.default_qdisc=fq
 sysctl -w net.ipv4.tcp_congestion_control=bbr
 
-# Буферы TCP (под ~1GB RAM)
-sysctl -w net.core.rmem_max=4194304
-sysctl -w net.core.wmem_max=4194304
-sysctl -w net.ipv4.tcp_rmem="4096 65536 4194304"
-sysctl -w net.ipv4.tcp_wmem="4096 32768 4194304"
+# Буферы TCP (под ~1GB RAM, увеличены для VPN)
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+sysctl -w net.ipv4.tcp_rmem="4096 87380 16777216"
+sysctl -w net.ipv4.tcp_wmem="4096 65536 16777216"
+
+# Оптимизация TCP для Xray
+sysctl -w net.ipv4.tcp_fin_timeout=10
+sysctl -w net.ipv4.tcp_tw_reuse=1
+sysctl -w net.ipv4.tcp_keepalive_time=300
+sysctl -w net.ipv4.tcp_keepalive_probes=3
+sysctl -w net.ipv4.tcp_keepalive_intvl=15
+sysctl -w net.core.somaxconn=65535
+sysctl -w net.ipv4.tcp_max_tw_buckets=1440000
+
+# MTU и TFO
+sysctl -w net.ipv4.tcp_mtu_probing=1
+sysctl -w net.ipv4.tcp_fastopen=3
 
 # Защита
 sysctl -w net.ipv4.tcp_syncookies=1
-sysctl -w net.ipv4.tcp_max_syn_backlog=2048
+sysctl -w net.ipv4.tcp_max_syn_backlog=16384
 sysctl -w net.ipv4.conf.all.rp_filter=1
 sysctl -w net.ipv4.icmp_echo_ignore_broadcasts=1
 
@@ -58,15 +71,28 @@ net.ipv6.conf.all.forwarding = 1
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# === Буферы TCP (~1GB RAM) ===
-net.core.rmem_max = 4194304
-net.core.wmem_max = 4194304
-net.ipv4.tcp_rmem = 4096 65536 4194304
-net.ipv4.tcp_wmem = 4096 32768 4194304
+# === Буферы TCP (~1GB RAM, оптимизированы для VPN) ===
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# === Оптимизация TCP для Xray ===
+net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 3
+net.ipv4.tcp_keepalive_intvl = 15
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_tw_buckets = 1440000
+
+# === MTU и TCP Fast Open ===
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
 
 # === Защита ===
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_max_syn_backlog = 16384
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 
@@ -151,6 +177,13 @@ sysctl net.core.rmem_max
 sysctl net.core.wmem_max
 
 echo ""
+echo "--- Оптимизация TCP для Xray ---"
+sysctl net.ipv4.tcp_fin_timeout
+sysctl net.ipv4.tcp_tw_reuse
+sysctl net.ipv4.tcp_fastopen
+sysctl net.core.somaxconn
+
+echo ""
 echo "--- Память ---"
 sysctl vm.swappiness
 sysctl vm.vfs_cache_pressure
@@ -177,3 +210,6 @@ echo "  /etc/sysctl.d/99-net-tuning.conf"
 echo "  /etc/modprobe.d/nf_conntrack.conf"
 echo "  /etc/security/limits.d/99-nofile.conf"
 echo "  /etc/systemd/system.conf.d/99-limits.conf"
+echo ""
+echo "ВНИМАНИЕ: Буферы TCP увеличены до 16 МБ."
+echo "При большом числе клиентов (100+) следите за памятью через 'free -h'"
