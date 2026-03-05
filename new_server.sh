@@ -82,33 +82,77 @@ if ! id -u "$NEW_USER" >/dev/null 2>&1; then
 else
   echo "👤 Пользователь '$NEW_USER' уже существует. Пропускаем создание."
 fi
+echo " Задай пароль для $NEW_USER:"
+passwd $NEW_USER
 
 # === Настройка SSH ===
 echo "🔐 Настройка безопасного доступа по SSH..."
 
-# Настройка конфигурации SSHD
-sed -i "s/#Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
-sed -i "s/.*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config  # Если уже раскомментирован
-sed -i "s/.*PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
-sed -i "s/.*PasswordAuthentication .*/PasswordAuthentication yes/" /etc/ssh/sshd_config  # Временно
-sed -i "s/.*PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
-sed -i "s/.*PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
-sed -i "s/.*MaxAuthTries .*/MaxAuthTries 3/" /etc/ssh/sshd_config
-sed -i "s/.*X11Forwarding .*/X11Forwarding no/" /etc/ssh/sshd_config
-# Чтобы локали нормально работали
-sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
-
-if systemctl list-units --type=service | grep -q "ssh.service"; then
+# 1. Определяем имя сервиса (ssh или sshd)
+if systemctl list-unit-files | grep -q "^ssh.service"; then
     SSH_SERVICE="ssh"
-elif systemctl list-units --type=service | grep -q "sshd.service"; then
+elif systemctl list-unit-files | grep -q "^sshd.service"; then
     SSH_SERVICE="sshd"
 else
-    echo "❌ SSH-сервис не найден!"
-    exit 1
+    echo "⚠️ SSH-сервис не найден как Unit, проверяем сокет..."
+    SSH_SERVICE="ssh" # Дефолт для большинства систем
 fi
 
-systemctl restart "$SSH_SERVICE"
-echo "🛡️ Сервер SSH настроен: вход под root отключен, порт изменен на $SSH_PORT."
+# 2. Правим конфиг sshd_config
+sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
+sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
+sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication yes/" /etc/ssh/sshd_config
+sed -i "s/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
+sed -i "s/^#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
+sed -i "s/^#\?MaxAuthTries .*/MaxAuthTries 3/" /etc/ssh/sshd_config
+sed -i "s/^#\?X11Forwarding .*/X11Forwarding no/" /etc/ssh/sshd_config
+sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
+
+# 3. СПЕЦИАЛЬНО ДЛЯ SOCKET ACTIVATION (Ubuntu 22.10+)
+# Если порт меняется, а управление идет через сокет, нужно править override.conf
+if systemctl list-units --all | grep -q "ssh.socket"; then
+    echo "⚙️ Обнаружен ssh.socket. Настраиваем переопределение порта..."
+    mkdir -p /etc/systemd/system/ssh.socket.d/
+    cat <<EOF > /etc/systemd/system/ssh.socket.d/override.conf
+[Socket]
+ListenStream=
+ListenStream=$SSH_PORT
+EOF
+    systemctl daemon-reload
+    systemctl restart ssh.socket
+fi
+
+# 4. Перезапуск основного сервиса
+systemctl restart "$SSH_SERVICE" || echo "⚠️ Не удалось перезапустить $SSH_SERVICE (возможно, он запустится через сокет)"
+
+echo "🛡️ Сервер SSH настроен: порт изменен на $SSH_PORT."
+
+# # === Настройка SSH ===
+# echo "🔐 Настройка безопасного доступа по SSH..."
+
+# # Настройка конфигурации SSHD
+# sed -i "s/#Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
+# sed -i "s/.*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config  # Если уже раскомментирован
+# sed -i "s/.*PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
+# sed -i "s/.*PasswordAuthentication .*/PasswordAuthentication yes/" /etc/ssh/sshd_config  # Временно
+# sed -i "s/.*PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
+# sed -i "s/.*PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
+# sed -i "s/.*MaxAuthTries .*/MaxAuthTries 3/" /etc/ssh/sshd_config
+# sed -i "s/.*X11Forwarding .*/X11Forwarding no/" /etc/ssh/sshd_config
+# # Чтобы локали нормально работали
+# sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
+
+# if systemctl list-units --type=service | grep -q "ssh.service"; then
+#     SSH_SERVICE="ssh"
+# elif systemctl list-units --type=service | grep -q "sshd.service"; then
+#     SSH_SERVICE="sshd"
+# else
+#     echo "❌ SSH-сервис не найден!"
+#     exit 1
+# fi
+
+# systemctl restart "$SSH_SERVICE"
+# echo "🛡️ Сервер SSH настроен: вход под root отключен, порт изменен на $SSH_PORT."
 
 # === Настройка Firewall (UFW) ===
 echo "🔥 Настройка файрвола UFW..."
@@ -126,26 +170,9 @@ ufw allow 443/tcp
 ufw --force enable
 echo "✅ Файрвол активирован. Открыты порты: $SSH_PORT (SSH), 80 (HTTP), 443 (HTTPS)."
 
-# === Настройка Fail2Ban ===
-echo "🚫 Настройка Fail2Ban для защиты SSH..."
-cat <<EOF >/etc/fail2ban/jail.local
-[sshd]
-enabled = true
-port    = $SSH_PORT
-filter  = sshd
-logpath = /var/log/auth.log
-maxretry = 5
-bantime = 1h
-EOF
-
-systemctl enable fail2ban
-systemctl restart fail2ban
-echo "✅ Fail2Ban настроен и запущен."
 
 # === Финальное сообщение ===
 echo ""
-echo " Задай пароль для $NEW_USER:"
-passwd $NEW_USER
 echo "🎉 === Настройка сервера успешно завершена! === 🎉"
 SERVER_IP=$(hostname -I | awk '{print $1}')
 echo "Не забудьте проверить лог выполнения в файле: /var/log/server-setup.log"
