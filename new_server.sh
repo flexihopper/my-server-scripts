@@ -7,45 +7,30 @@ exec > >(tee -a /var/log/server-setup.log) 2>&1
 
 echo "🚀 Начало настройки сервера: $(date)"
 
-# === Переменные (замени на свои) ===
+# === Переменные ===
 NEW_USER="www"
-SSH_PORT="2244"   # можно поменять на нестандартный, напр. 2222
-TIMEZONE="Europe/Moscow" # Укажи свой часовой пояс (список: timedatectl list-timezones)
-PYTHON_VERSION="3.12" # Версия Python для установки
+SSH_PORT="2244"
+TIMEZONE="Europe/Moscow"
+PYTHON_VERSION="3.12"
 
 # === Обновление системы ===
 echo "🔄 Обновление пакетов системы..."
 apt update && apt upgrade -y
 
-# === Установка базовых и дополнительных пакетов ===
+# === Установка пакетов (без fail2ban) ===
 echo "📦 Установка необходимых пакетов..."
 apt install -y \
-  sudo \
-  curl \
-  wget \
-  git \
-  ufw \
-  htop \
-  unzip \
-  mc \
-  ncdu \
-  software-properties-common \
-  apt-transport-https \
-  ca-certificates \
-  fail2ban \
-  build-essential
+  sudo curl wget git ufw htop unzip mc ncdu \
+  software-properties-common apt-transport-https \
+  ca-certificates build-essential psmisc vim
 
 # === Настройка hostname ===
-echo "🏷️  Текущий hostname: $(hostname)"
+echo "🏷️ Текущий hostname: $(hostname)"
 read -p "Введите новый hostname (Enter для пропуска): " NEW_HOSTNAME
-
 if [ -n "$NEW_HOSTNAME" ]; then
-  hostnamectl set-hostname "$NEW_HOSTNAME"
-  sed -i "s/127.0.1.1.*/127.0.1.1       $NEW_HOSTNAME/" /etc/hosts
-  grep -q "127.0.1.1" /etc/hosts || echo "127.0.1.1       $NEW_HOSTNAME" >> /etc/hosts
-  echo "✅ Hostname изменён на: $NEW_HOSTNAME"
-else
-  echo "⏭️  Hostname не изменён."
+    hostnamectl set-hostname "$NEW_HOSTNAME"
+    sed -i "s/127.0.1.1.*/127.0.1.1       $NEW_HOSTNAME/" /etc/hosts
+    echo "✅ Hostname изменён на: $NEW_HOSTNAME"
 fi
 
 # === Настройка часового пояса ===
@@ -59,142 +44,94 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "🐳 Установка Docker..."
     curl -fsSL https://get.docker.com -o get-docker.sh
     sh get-docker.sh
-    usermod -aG docker $NEW_USER
     systemctl enable docker
     echo "✅ Docker установлен."
 fi
 
-# === Установка свежей версии Python ===
-read -p "Установить Python? (y/N): " -n 1 -r
+# === Установка Python ===
+read -p "Установить Python $PYTHON_VERSION? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo "🐍 Установка Python $PYTHON_VERSION из PPA deadsnakes..."
+    echo "🐍 Установка Python..."
     add-apt-repository ppa:deadsnakes/ppa -y
     apt update
     apt install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev
 fi
-# === Создание нового пользователя ===
+
+# === Создание пользователя ===
 if ! id -u "$NEW_USER" >/dev/null 2>&1; then
-  echo "👤 Создание нового пользователя '$NEW_USER'..."
-  adduser --disabled-password --gecos "" "$NEW_USER"
-  usermod -aG sudo "$NEW_USER"
-  echo "✅ Пользователь '$NEW_USER' создан и добавлен в группу sudo."
+    echo "👤 Создание пользователя '$NEW_USER'..."
+    adduser --disabled-password --gecos "" "$NEW_USER"
+    usermod -aG sudo "$NEW_USER"
+    # Добавляем в группу docker, если он установлен
+    [ -f /usr/bin/docker ] && usermod -aG docker "$NEW_USER"
+    echo "✅ Пользователь '$NEW_USER' создан."
 else
-  echo "👤 Пользователь '$NEW_USER' уже существует. Пропускаем создание."
+    echo "👤 Пользователь '$NEW_USER' уже существует."
 fi
-echo " Задай пароль для $NEW_USER:"
-passwd $NEW_USER
+echo "🔑 Задай пароль для $NEW_USER (нужен для sudo):"
+passwd "$NEW_USER"
 
-# === Настройка SSH ===
-echo "🔐 Настройка безопасного доступа по SSH..."
+# === Настройка SSH (Классический режим без сокетов) ===
+echo "🔐 Настройка SSH на порту $SSH_PORT..."
 
-# 1. Определяем имя сервиса (ssh или sshd)
-if systemctl list-unit-files | grep -q "^ssh.service"; then
-    SSH_SERVICE="ssh"
-elif systemctl list-unit-files | grep -q "^sshd.service"; then
-    SSH_SERVICE="sshd"
-else
-    echo "⚠️ SSH-сервис не найден как Unit, проверяем сокет..."
-    SSH_SERVICE="ssh" # Дефолт для большинства систем
+# 1. Полное отключение ssh.socket (решение для Ubuntu 24.04+)
+if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.socket; then
+    echo "⚙️ Деактивация ssh.socket..."
+    systemctl stop ssh.socket || true
+    systemctl disable ssh.socket || true
+    systemctl mask ssh.socket || true
 fi
 
-# 2. Правим конфиг sshd_config
+# 2. Правка конфигурации sshd_config
+# Используем безопасные настройки: без паролей, без root, кастомный порт
 sed -i "s/^#\?Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
 sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
 sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication yes/" /etc/ssh/sshd_config
 sed -i "s/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
 sed -i "s/^#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
-sed -i "s/^#\?MaxAuthTries .*/MaxAuthTries 3/" /etc/ssh/sshd_config
-sed -i "s/^#\?X11Forwarding .*/X11Forwarding no/" /etc/ssh/sshd_config
 sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
 
-# 3. СПЕЦИАЛЬНО ДЛЯ SOCKET ACTIVATION (Ubuntu 22.10+)
-# Если порт меняется, а управление идет через сокет, нужно править override.conf
-if systemctl list-units --all | grep -q "ssh.socket"; then
-    echo "⚙️ Обнаружен ssh.socket. Настраиваем переопределение порта..."
-    mkdir -p /etc/systemd/system/ssh.socket.d/
-    cat <<EOF > /etc/systemd/system/ssh.socket.d/override.conf
-[Socket]
-ListenStream=
-ListenStream=$SSH_PORT
-EOF
-    systemctl daemon-reload
-    systemctl restart ssh.socket
-fi
-
-# 4. Перезапуск основного сервиса
-systemctl restart "$SSH_SERVICE" || echo "⚠️ Не удалось перезапустить $SSH_SERVICE (возможно, он запустится через сокет)"
-
-echo "🛡️ Сервер SSH настроен: порт изменен на $SSH_PORT."
-
-# # === Настройка SSH ===
-# echo "🔐 Настройка безопасного доступа по SSH..."
-
-# # Настройка конфигурации SSHD
-# sed -i "s/#Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config
-# sed -i "s/.*Port .*/Port $SSH_PORT/" /etc/ssh/sshd_config  # Если уже раскомментирован
-# sed -i "s/.*PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
-# sed -i "s/.*PasswordAuthentication .*/PasswordAuthentication yes/" /etc/ssh/sshd_config  # Временно
-# sed -i "s/.*PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
-# sed -i "s/.*PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
-# sed -i "s/.*MaxAuthTries .*/MaxAuthTries 3/" /etc/ssh/sshd_config
-# sed -i "s/.*X11Forwarding .*/X11Forwarding no/" /etc/ssh/sshd_config
-# # Чтобы локали нормально работали
-# sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
-
-# if systemctl list-units --type=service | grep -q "ssh.service"; then
-#     SSH_SERVICE="ssh"
-# elif systemctl list-units --type=service | grep -q "sshd.service"; then
-#     SSH_SERVICE="sshd"
-# else
-#     echo "❌ SSH-сервис не найден!"
-#     exit 1
-# fi
-
-# systemctl restart "$SSH_SERVICE"
-# echo "🛡️ Сервер SSH настроен: вход под root отключен, порт изменен на $SSH_PORT."
+# 3. Перезапуск классического сервиса
+systemctl daemon-reload
+systemctl enable ssh
+systemctl restart ssh
 
 # === Настройка Firewall (UFW) ===
-echo "🔥 Настройка файрвола UFW..."
-
-UFW_FILE="/etc/default/ufw"
-BACKUP_FILE="${UFW_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-
-echo "Создаём бэкап UFW-конфига..."
-cp "$UFW_FILE" "$BACKUP_FILE"
-echo "Бэкап сохранён: $BACKUP_FILE"
-
-ufw allow $SSH_PORT/tcp
+echo "🔥 Настройка UFW..."
+ufw allow "$SSH_PORT"/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
 ufw --force enable
-echo "✅ Файрвол активирован. Открыты порты: $SSH_PORT (SSH), 80 (HTTP), 443 (HTTPS)."
 
+# === Очистка системы ===
+echo "🧹 Очистка системы от временных файлов..."
+apt autoremove -y  # Удаляет неиспользуемые зависимости
+apt autoclean -y   # Удаляет устаревшие архивы пакетов
+rm -rf /var/lib/apt/lists/* # Очищает кэш списков пакетов (уменьшает размер /var)
+rm -f get-docker.sh # Удаляет скрипт установки Docker, если он остался
 
-# === Финальное сообщение ===
-echo ""
-echo "🎉 === Настройка сервера успешно завершена! === 🎉"
+# === Финал ===
 SERVER_IP=$(hostname -I | awk '{print $1}')
-echo "Не забудьте проверить лог выполнения в файле: /var/log/server-setup.log"
-echo "Скопируй SSH ключ на сервер:"
-echo "ssh-copy-id -p $SSH_PORT $NEW_USER@$SERVER_IP"
-echo "Для подключения используйте команду:"
-echo "ssh -p $SSH_PORT $NEW_USER@$SERVER_IP"
 echo ""
-echo "🔐 Хотите отключить парольную аутентификацию SSH? (рекомендуется после копирования ключа)"
-echo "Убедитесь, что вы скопировали SSH-ключ командой:"
-echo "  ssh-copy-id -p $SSH_PORT $NEW_USER@$SERVER_IP"
+echo "🎉 Базовая настройка завершена!"
+echo "----------------------------------------------------"
+echo "СЛЕДУЮЩИЕ ШАГИ:"
+echo "1. Со своего ПК скопируй ключ:"
+echo "   ssh-copy-id -p $SSH_PORT $NEW_USER@$SERVER_IP"
 echo ""
-read -p "Отключить вход по паролю? (y/N): " -n 1 -r
+echo "2. Проверь вход по ключу:"
+echo "   ssh -p $SSH_PORT $NEW_USER@$SERVER_IP"
+echo "----------------------------------------------------"
+
+read -p "🔐 Отключить вход по паролю прямо сейчас? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
-    sed -i "s/.*PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
-    systemctl restart "$SSH_SERVICE"
-    echo "✅ Парольная аутентификация отключена!"
+    sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
+    systemctl restart ssh
+    echo "✅ Готово! Вход по паролю отключен. Доступ только по SSH-ключам."
 else
-    echo "⚠️  Парольная аутентификация оставлена включенной."
-    echo "Отключите её позже командой:"
-    echo "sudo sed -i 's/.*PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config"
-    echo "sudo systemctl restart ssh"
+    echo "⚠️ Вход по паролю ОСТАВЛЕН ВКЛЮЧЕННЫМ. Не забудьте отключить его позже!"
 fi
+
 echo "🚀 Настройка завершена: $(date)"
