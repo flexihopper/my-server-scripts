@@ -48,6 +48,36 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "✅ Docker установлен."
 fi
 
+# === Установка Node.js ===
+read -p "❓ Установить Node.js v$NODE_MAJOR? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "🟢 Установка Node.js..."
+    curl -fsSL https://deb.nodesource.com/setup_$NODE_MAJOR.x | bash -
+    apt install -y nodejs
+    echo "✅ Node.js $(node -v) установлен."
+fi
+
+# === Установка Redis ===
+read -p "❓ Установить Redis? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "🟥 Установка Redis..."
+    apt install -y redis-server
+    systemctl enable redis-server
+    echo "✅ Redis установлен и запущен."
+fi
+
+# === Установка PostgreSQL ===
+read -p "❓ Установить PostgreSQL? (y/N): " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    echo "🐘 Установка PostgreSQL..."
+    apt install -y postgresql postgresql-contrib
+    systemctl enable postgresql
+    echo "✅ PostgreSQL установлен."
+fi
+
 # === Установка Python ===
 read -p "Установить Python $PYTHON_VERSION? (y/N): " -n 1 -r
 echo
