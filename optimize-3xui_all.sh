@@ -267,7 +267,7 @@ fi
 if command -v cpufreq-set &>/dev/null; then
     CPUFREQ_OK=0
     for i in $(seq 0 $(( CPU_CORES - 1 ))); do
-        cpufreq-set -c "$i" -g performance 2>/dev/null && CPUFREQ_OK=1 || true
+        cpufreq-set -c "$i" -g performance &>/dev/null && CPUFREQ_OK=1 || true
     done
     [ "$CPUFREQ_OK" -eq 1 ] && echo "    [+] cpufrequtils — governor закреплён" \
                              || echo "    [~] cpufrequtils недоступен на этой VM"
