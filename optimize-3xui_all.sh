@@ -263,35 +263,40 @@ else
     GOV_APPLIED=2  # пометка: не ошибка, просто недоступно
 fi
 
-# Сохраняем через cpufrequtils или systemd (если доступно)
-if command -v cpufreq-set &>/dev/null; then
-    CPUFREQ_OK=0
-    for i in $(seq 0 $(( CPU_CORES - 1 ))); do
-        cpufreq-set -c "$i" -g performance &>/dev/null && CPUFREQ_OK=1 || true
-    done
-    [ "$CPUFREQ_OK" -eq 1 ] && echo "    [+] cpufrequtils — governor закреплён" \
-                             || echo "    [~] cpufrequtils недоступен на этой VM"
-elif [ -f /etc/default/cpufrequtils ]; then
-    sed -i 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils
-    echo "    [+] /etc/default/cpufrequtils обновлён"
-fi
-
-# Через systemd-cpupower (если есть)
-if command -v cpupower &>/dev/null; then
-    cpupower frequency-set -g performance 2>/dev/null && echo "    [+] cpupower — governor применён" || true
-fi
-
-# rc.local fallback — гарантия при reboot
+# rc.local fallback — нужен всегда (создаём если нет)
 RC_LOCAL="/etc/rc.local"
 if [ ! -f "$RC_LOCAL" ]; then
     echo '#!/bin/bash' > "$RC_LOCAL"
     echo 'exit 0' >> "$RC_LOCAL"
     chmod +x "$RC_LOCAL"
 fi
-# Вставляем перед exit 0
-if ! grep -q "scaling_governor" "$RC_LOCAL"; then
-    sed -i '/^exit 0/i for F in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f "$F" ] \&\& echo performance > "$F"; done' "$RC_LOCAL"
-    echo "    [+] rc.local — governor будет применяться при reboot"
+
+# Продолжаем только если cpufreq реально доступен
+if [ "$GOV_APPLIED" -ne 2 ]; then
+    # Сохраняем через cpufrequtils (если доступно)
+    if command -v cpufreq-set &>/dev/null; then
+        CPUFREQ_OK=0
+        for i in $(seq 0 $(( CPU_CORES - 1 ))); do
+            cpufreq-set -c "$i" -g performance &>/dev/null && CPUFREQ_OK=1 || true
+        done
+        [ "$CPUFREQ_OK" -eq 1 ] && echo "    [+] cpufrequtils — governor закреплён" \
+                                 || echo "    [~] cpufrequtils: не удалось применить"
+    elif [ -f /etc/default/cpufrequtils ]; then
+        sed -i 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils
+        echo "    [+] /etc/default/cpufrequtils обновлён"
+    fi
+
+    # Через cpupower (если есть)
+    if command -v cpupower &>/dev/null; then
+        cpupower frequency-set -g performance &>/dev/null \
+            && echo "    [+] cpupower — governor применён" || true
+    fi
+
+    # rc.local — применять при reboot
+    if ! grep -q "scaling_governor" "$RC_LOCAL"; then
+        sed -i '/^exit 0/i for F in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f "$F" ] \&\& echo performance > "$F"; done' "$RC_LOCAL"
+        echo "    [+] rc.local — governor будет применяться при reboot"
+    fi
 fi
 
 # ─────────────────────────────────────────────
