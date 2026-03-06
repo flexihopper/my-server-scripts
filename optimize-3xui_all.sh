@@ -33,7 +33,10 @@ fi
 # ─────────────────────────────────────────────
 # 1. ОПРЕДЕЛЕНИЕ РЕСУРСОВ
 # ─────────────────────────────────────────────
-TOTAL_RAM=$(free -g | awk '/^Mem:/{print $2}')
+
+# free -g округляет вниз: 1.9GB → 1 (неверный профиль).
+# Используем MB и сравниваем точнее.
+TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
 CPU_CORES=$(nproc)
 CPU_MASK=$(printf '%x' $(( (1 << CPU_CORES) - 1 )))
 
@@ -41,17 +44,20 @@ echo ""
 echo "========================================"
 echo "   3x-ui Production Optimizer v3"
 echo "========================================"
-echo "  RAM: ${TOTAL_RAM}GB | CPU: ${CPU_CORES} cores (mask: 0x${CPU_MASK})"
+echo "  RAM: ${TOTAL_RAM_MB}MB | CPU: ${CPU_CORES} cores (mask: 0x${CPU_MASK})"
 echo "========================================"
 
 # --- Профиль по RAM ---
-if [ "$TOTAL_RAM" -le 1 ]; then
+# Граница 1GB:   < 1536MB  (до 1.5GB включительно)
+# Граница 2-3GB: < 3840MB  (до 3.75GB включительно)
+# Граница 4GB+:  всё остальное
+if [ "$TOTAL_RAM_MB" -lt 1536 ]; then
     RAM_TIER="1GB"
     CONNTRACK=131072;  HASHSIZE=32768
     BUFF_MAX=16777216; BUFF_TCP="4096 87380 16777216"
     NOFILE=65535;      FIN_TIMEOUT=7
     MAX_ORPHANS=16384; TW_BUCKETS=262144
-elif [ "$TOTAL_RAM" -le 3 ]; then
+elif [ "$TOTAL_RAM_MB" -lt 3840 ]; then
     RAM_TIER="2-3GB"
     CONNTRACK=262144;  HASHSIZE=65536
     BUFF_MAX=33554432; BUFF_TCP="4096 87380 33554432"
@@ -259,10 +265,12 @@ fi
 
 # Сохраняем через cpufrequtils или systemd (если доступно)
 if command -v cpufreq-set &>/dev/null; then
+    CPUFREQ_OK=0
     for i in $(seq 0 $(( CPU_CORES - 1 ))); do
-        cpufreq-set -c "$i" -g performance 2>/dev/null || true
+        cpufreq-set -c "$i" -g performance 2>/dev/null && CPUFREQ_OK=1 || true
     done
-    echo "    [+] cpufrequtils — governor закреплён"
+    [ "$CPUFREQ_OK" -eq 1 ] && echo "    [+] cpufrequtils — governor закреплён" \
+                             || echo "    [~] cpufrequtils недоступен на этой VM"
 elif [ -f /etc/default/cpufrequtils ]; then
     sed -i 's/^GOVERNOR=.*/GOVERNOR="performance"/' /etc/default/cpufrequtils
     echo "    [+] /etc/default/cpufrequtils обновлён"
@@ -672,7 +680,7 @@ echo ""
 echo "========================================"
 echo "   ОПТИМИЗАЦИЯ ВЫПОЛНЕНА УСПЕШНО"
 echo "========================================"
-printf "  %-22s: %s\n" "RAM профиль"       "$RAM_TIER"
+printf "  %-22s: %s\n" "RAM профиль"       "$RAM_TIER (${TOTAL_RAM_MB}MB)"
 printf "  %-22s: %s\n" "CPU профиль"       "$CPU_TIER"
 printf "  %-22s: %s\n" "TCP CC"            "$TCP_CC"
 printf "  %-22s: %s\n" "Conntrack max"     "$CONNTRACK"
@@ -687,7 +695,7 @@ printf "  %-22s: %s\n" "Max Orphans"       "$MAX_ORPHANS"
 printf "  %-22s: %s\n" "NOFILE"            "$NOFILE"
 printf "  %-22s: %s\n" "RPS/RFS"           "$([ "$RPS_ENABLED" -eq 1 ] && echo "Вкл (mask=0x${CPU_MASK}, flows=${FLOW_ENTRIES})" || echo "Откл (1 ядро)")"
 printf "  %-22s: %s\n" "CPU Governor"      "$([ "$GOV_APPLIED" -eq 1 ] && echo "performance" || echo "недоступен (VM)")"
-printf "  %-22s: %s\n" "IRQ Affinity"      "$([ "$CPU_CORES" -gt 1 ] && echo "применён" || echo "откл (1 ядро)")"
+printf "  %-22s: %s\n" "IRQ Affinity"      "$([ "${IRQ_APPLIED:-0}" -gt 0 ] && echo "применён (${IRQ_APPLIED} IRQ)" || ([ "$CPU_CORES" -le 1 ] && echo "откл (1 ядро)" || echo "недоступен (VM)"))"
 printf "  %-22s: %s\n" "NIC Offloading"    "$([ "$IS_VIRTUAL" -eq 0 ] && echo "TSO/GSO/GRO вкл" || echo "TSO/GSO выкл, GRO вкл (VM)")"
 printf "  %-22s: %s\n" "THP"               "$([ "$THP_APPLIED" -eq 1 ] && echo "отключён" || echo "не найден")"
 printf "  %-22s: %s\n" "I/O Scheduler"     "mq-deadline / none (NVMe)"
