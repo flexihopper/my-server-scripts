@@ -206,3 +206,6 @@ __marimo__/
 /API/test_api.py
 /tests/
 .DS_Store
+
+# Serena IDE plugin context/memory
+.serena/
