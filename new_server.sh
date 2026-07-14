@@ -132,6 +132,7 @@ echo "🔥 Настройка UFW..."
 ufw allow "$SSH_PORT"/tcp
 ufw allow 80/tcp
 ufw allow 443/tcp
+ufw reject out 25/tcp
 ufw --force enable
 
 # === Очистка системы ===
