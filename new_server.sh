@@ -12,6 +12,7 @@ NEW_USER="www"
 SSH_PORT="2244"
 TIMEZONE="Europe/Moscow"
 PYTHON_VERSION="3.12"
+NODE_MAJOR="22"
 
 # === Обновление системы ===
 echo "🔄 Обновление пакетов системы..."
@@ -83,7 +84,7 @@ read -p "Установить Python $PYTHON_VERSION? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "🐍 Установка Python..."
-    add-apt-get-repository ppa:deadsnakes/ppa -y
+    add-apt-repository ppa:deadsnakes/ppa -y
     apt-get update
     apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev
 fi
