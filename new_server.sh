@@ -15,11 +15,11 @@ PYTHON_VERSION="3.12"
 
 # === Обновление системы ===
 echo "🔄 Обновление пакетов системы..."
-apt update && apt upgrade -y
+apt-get update && apt-get upgrade -y
 
 # === Установка пакетов (без fail2ban) ===
 echo "📦 Установка необходимых пакетов..."
-apt install -y \
+apt-get install -y \
   sudo curl wget git ufw htop unzip mc ncdu \
   software-properties-common apt-transport-https \
   ca-certificates build-essential psmisc vim
@@ -54,7 +54,7 @@ echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "🟢 Установка Node.js..."
     curl -fsSL https://deb.nodesource.com/setup_$NODE_MAJOR.x | bash -
-    apt install -y nodejs
+    apt-get install -y nodejs
     echo "✅ Node.js $(node -v) установлен."
 fi
 
@@ -63,7 +63,7 @@ read -p "❓ Установить Redis? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "🟥 Установка Redis..."
-    apt install -y redis-server
+    apt-get install -y redis-server
     systemctl enable redis-server
     echo "✅ Redis установлен и запущен."
 fi
@@ -73,7 +73,7 @@ read -p "❓ Установить PostgreSQL? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "🐘 Установка PostgreSQL..."
-    apt install -y postgresql postgresql-contrib
+    apt-get install -y postgresql postgresql-contrib
     systemctl enable postgresql
     echo "✅ PostgreSQL установлен."
 fi
@@ -83,9 +83,9 @@ read -p "Установить Python $PYTHON_VERSION? (y/N): " -n 1 -r
 echo
 if [[ $REPLY =~ ^[Yy]$ ]]; then
     echo "🐍 Установка Python..."
-    add-apt-repository ppa:deadsnakes/ppa -y
-    apt update
-    apt install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev
+    add-apt-get-repository ppa:deadsnakes/ppa -y
+    apt-get update
+    apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python${PYTHON_VERSION}-dev
 fi
 
 # === Создание пользователя ===
@@ -137,13 +137,13 @@ ufw --force enable
 
 # === Очистка системы ===
 echo "🧹 Очистка системы от временных файлов..."
-apt autoremove -y  # Удаляет неиспользуемые зависимости
-apt autoclean -y   # Удаляет устаревшие архивы пакетов
+apt-get autoremove -y  # Удаляет неиспользуемые зависимости
+apt-get autoclean -y   # Удаляет устаревшие архивы пакетов
 rm -rf /var/lib/apt/lists/* # Очищает кэш списков пакетов (уменьшает размер /var)
 rm -f get-docker.sh # Удаляет скрипт установки Docker, если он остался
 
 # === Финал ===
-SERVER_IP=$(hostname -I | awk '{print $1}')
+SERVER_IP=$(curl -s https://api.ipify.org)
 echo ""
 echo "🎉 Базовая настройка завершена!"
 echo "----------------------------------------------------"
