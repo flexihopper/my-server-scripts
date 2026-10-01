@@ -134,8 +134,8 @@ else
     fi
 fi
 
-# Добавляем в группу docker, если он установлен и пользователь ещё не в группе
-if [ -f /usr/bin/docker ]; then
+# Добавляем в группу docker, если группа существует и пользователь ещё не в ней
+if getent group docker >/dev/null; then
     if ! id -nG "$NEW_USER" | grep -qw docker; then
         usermod -aG docker "$NEW_USER"
         echo "✅ Пользователь '$NEW_USER' добавлен в группу docker."
@@ -161,6 +161,10 @@ if systemctl is-active --quiet ssh.socket || systemctl is-enabled --quiet ssh.so
     systemctl disable ssh.socket || true
     systemctl mask ssh.socket || true
 fi
+
+# Включаем классический сервис сразу: если скрипт упадёт ниже,
+# SSH всё равно поднимется после перезагрузки
+systemctl enable ssh
 
 # 2. Удаляем конфликтующие drop-in конфиги (cloud-init и др.)
 echo "🧹 Очистка drop-in конфигов SSH..."
@@ -190,6 +194,9 @@ sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
 
 # 4. Проверка конфига перед применением
 echo "🔍 Проверка синтаксиса SSH конфига..."
+# Каталог privilege separation может отсутствовать до первого старта sshd,
+# без него sshd -t падает с "Missing privilege separation directory"
+mkdir -p /run/sshd
 if ! sshd -t; then
     echo "❌ ОШИБКА в конфигурации SSH! Откатываем..."
     cp "$SSH_BACKUP" /etc/ssh/sshd_config
