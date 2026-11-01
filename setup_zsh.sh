@@ -2,18 +2,9 @@
 
 # --- Скрипт для полной автоматической установки Zsh + Oh My Zsh + Powerlevel10k + плагины ---
 
-echo "Шаг 1: Установка необходимых пакетов (zsh, git, curl, bat)..."
+echo "Шаг 1: Установка необходимых пакетов (zsh, git, curl)..."
 sudo apt update
-sudo apt install -y zsh git curl bat
-
-# На Ubuntu пакет 'bat' может установиться как 'batcat' из-за конфликта имен.
-# Создаем символическую ссылку, чтобы команда 'bat' работала как надо.
-if ! command -v bat &> /dev/null; then
-    if command -v batcat &> /dev/null; then
-        echo "Создание символической ссылки для bat -> batcat..."
-        sudo ln -s /usr/bin/batcat /usr/local/bin/bat
-    fi
-fi
+sudo apt install -y zsh git curl
 
 echo "------------------------------------------------------------"
 echo "Шаг 2: Установка Oh My Zsh..."
@@ -44,7 +35,6 @@ plugins=(
     ["zsh-autosuggestions"]="https://github.com/zsh-users/zsh-autosuggestions.git"
     ["zsh-history-substring-search"]="https://github.com/zsh-users/zsh-history-substring-search.git"
     ["you-should-use"]="https://github.com/MichaelAquilina/zsh-you-should-use.git"
-    ["zsh-bat"]="https://github.com/fdellwing/zsh-bat.git"
 )
 
 for name in "${!plugins[@]}"; do
@@ -63,7 +53,7 @@ echo "Шаг 5: Настройка файла ~/.zshrc..."
 sed -i '/^ZSH_THEME=/c\ZSH_THEME="powerlevel10k/powerlevel10k"' ~/.zshrc
 
 # Установка списка плагинов
-sed -i '/^plugins=/c\plugins=(\n  git\n  zsh-syntax-highlighting\n  zsh-autosuggestions\n  zsh-history-substring-search\n  you-should-use\n  zsh-bat\n)' ~/.zshrc
+sed -i '/^plugins=/c\plugins=(\n  git\n  zsh-syntax-highlighting\n  zsh-autosuggestions\n  zsh-history-substring-search\n  you-should-use\n)' ~/.zshrc
 
 echo "Файл ~/.zshrc успешно настроен."
 
