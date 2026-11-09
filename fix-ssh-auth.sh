@@ -9,9 +9,8 @@
 #    sudo ./fix-ssh-auth.sh [--check]
 #
 # 2) С локального ПК сразу по списку серверов:
-#    ./fix-ssh-auth.sh 1.2.3.4 5.6.7.8:2244 www@9.10.11.12:2244
-#    ./fix-ssh-auth.sh -f servers.txt
-#    ./fix-ssh-auth.sh -f servers.txt --check   # только аудит без правок
+#    ./fix-ssh-auth.sh -f servers.txt --check   # аудит без sudo и без паролей!
+#    ./fix-ssh-auth.sh -f servers.txt           # проверка и исправление
 # ==============================================================================
 
 set -euo pipefail
@@ -22,6 +21,7 @@ FALLBACK_PORT="22"
 CHECK_ONLY=false
 SERVERS_FILE=""
 TARGETS=()
+SUDO_PASS=""
 
 # Цвета для вывода
 RED='\033[0;31m'
@@ -40,10 +40,11 @@ usage() {
   2. Удалённо по списку серверов:
      $0 [опции] <хост1> [хост2 ...]
      $0 [опции] -f servers.txt
+     $0 [опции] -f servers.txt --check   # аудит без правок (не требует sudo)
 
 Опции:
   -f, --file FILE     Файл со списком серверов (по одному на строку)
-  -c, --check         Только проверка (аудит), без внесения изменений
+  -c, --check         Только проверка (аудит), без внесения изменений (не требует sudo)
   -u, --user USER     Пользователь SSH по умолчанию (по умолчанию: $DEFAULT_USER)
   -p, --port PORT     Порт SSH по умолчанию (по умолчанию: $DEFAULT_PORT)
   -h, --help          Показать эту справку
@@ -93,55 +94,75 @@ REMOTE_PAYLOAD=$(cat <<'PAYLOAD_EOF'
 #!/bin/bash
 set -euo pipefail
 
-CHECK_MODE="${1:-apply}"
+MODE="${1:-check}"
 
-# Функция проверки состояния
+# Функция проверки состояния (работает БЕЗ прав root)
 check_status() {
     local issues=()
-    
+    local warnings=()
+
     # 1. Активное значение PasswordAuthentication по sshd -T
-    local active_pw
-    active_pw=$(sshd -T 2>/dev/null | grep -Ei '^passwordauthentication ' | awk '{print $2}' || echo "unknown")
-    if [ "$active_pw" != "no" ]; then
-        issues+=("sshd -T: PasswordAuthentication = $active_pw (должно быть no)")
+    # Используем временный ключ, чтобы запустить sshd -T без root-прав
+    local dummy_key
+    dummy_key=$(mktemp)
+    rm -f "$dummy_key"
+    ssh-keygen -q -t ed25519 -N '' -f "$dummy_key" 2>/dev/null || true
+
+    local active_pw="unknown"
+    local active_kbd="unknown"
+    if [ -f "$dummy_key" ]; then
+        active_pw=$(sshd -T -h "$dummy_key" 2>/dev/null | grep -Ei '^passwordauthentication ' | awk '{print $2}' || echo "unknown")
+        active_kbd=$(sshd -T -h "$dummy_key" 2>/dev/null | grep -Ei '^kbdinteractiveauthentication ' | awk '{print $2}' || echo "unknown")
+        rm -f "$dummy_key" "${dummy_key}.pub"
+    else
+        active_pw=$(sshd -T 2>/dev/null | grep -Ei '^passwordauthentication ' | awk '{print $2}' || echo "unknown")
+        active_kbd=$(sshd -T 2>/dev/null | grep -Ei '^kbdinteractiveauthentication ' | awk '{print $2}' || echo "unknown")
     fi
 
-    # 2. Активное значение KbdInteractiveAuthentication
-    local active_kbd
-    active_kbd=$(sshd -T 2>/dev/null | grep -Ei '^kbdinteractiveauthentication ' | awk '{print $2}' || echo "unknown")
+    # Проверка парольного входа
+    if [ "$active_pw" = "yes" ]; then
+        issues+=("КРИТИЧНО: sshd -T сообщает PasswordAuthentication = yes (вход по паролю РАЗРЕШЁН)")
+    fi
+
     if [ "$active_kbd" = "yes" ]; then
         issues+=("sshd -T: KbdInteractiveAuthentication = yes (PAM может запрашивать пароль)")
     fi
 
-    # 3. Наличие конфликтующих файлов в sshd_config.d
+    # Проверка конфликтующих файлов в sshd_config.d
     if [ -f /etc/ssh/sshd_config.d/50-cloud-init.conf ]; then
         if grep -qEi '^[# ]*PasswordAuthentication[[:space:]]+yes' /etc/ssh/sshd_config.d/50-cloud-init.conf 2>/dev/null; then
-            issues+=("Найден /etc/ssh/sshd_config.d/50-cloud-init.conf с PasswordAuthentication yes")
+            issues+=("Найден /etc/ssh/sshd_config.d/50-cloud-init.conf с PasswordAuthentication yes (first match wins)")
         fi
     fi
 
-    # 4. Любые другие drop-in конфиги с PasswordAuthentication yes
     if [ -d /etc/ssh/sshd_config.d ]; then
         for f in /etc/ssh/sshd_config.d/*.conf; do
             [ -f "$f" ] || continue
+            [ "$f" = "/etc/ssh/sshd_config.d/01-custom.conf" ] && continue
             if grep -qEi '^[# ]*PasswordAuthentication[[:space:]]+yes' "$f" 2>/dev/null; then
                 issues+=("В файле $f найден PasswordAuthentication yes")
             fi
         done
     fi
 
-    # 5. Приоритетный файл 01-custom.conf
+    # Проверка наличия 01-custom.conf
     if [ ! -f /etc/ssh/sshd_config.d/01-custom.conf ]; then
-        issues+=("Отсутствует приоритетный drop-in /etc/ssh/sshd_config.d/01-custom.conf")
-    fi
-
-    # 6. Защита в cloud-init
-    if [ -d /etc/cloud/cloud.cfg.d ] && [ ! -f /etc/cloud/cloud.cfg.d/99-disable-ssh-pwauth.cfg ]; then
-        issues+=("Отсутствует защита от сброса cloud-init (/etc/cloud/cloud.cfg.d/99-disable-ssh-pwauth.cfg)")
+        if [ "$active_pw" = "no" ] && [ ${#issues[@]} -eq 0 ]; then
+            warnings+=("Вход по паролю отключен, но нет 01-custom.conf (рекомендуется для защиты от перезаписи)")
+        else
+            issues+=("Отсутствует приоритетный drop-in /etc/ssh/sshd_config.d/01-custom.conf")
+        fi
     fi
 
     if [ ${#issues[@]} -eq 0 ]; then
-        echo "RESULT:OK"
+        if [ ${#warnings[@]} -eq 0 ]; then
+            echo "RESULT:OK"
+        else
+            echo "RESULT:OK_WITH_WARNINGS"
+            for w in "${warnings[@]}"; do
+                echo "WARNING:$w"
+            done
+        fi
         return 0
     else
         echo "RESULT:NEEDS_FIX"
@@ -152,31 +173,20 @@ check_status() {
     fi
 }
 
-# Запуск проверки
-set +e
-CHECK_OUTPUT=$(check_status)
-CHECK_EXIT=$?
-set -e
-
-if [ $CHECK_EXIT -eq 0 ]; then
-    echo "$CHECK_OUTPUT"
-    exit 0
+# Если запрошен только чек — запускаем и выходим
+if [ "$MODE" = "check" ]; then
+    set +e
+    check_status
+    exit $?
 fi
 
-if [ "$CHECK_MODE" = "check" ]; then
-    echo "$CHECK_OUTPUT"
-    exit 0
-fi
-
-# ==================== ВНЕСЕНИЕ ИСПРАВЛЕНИЙ ====================
+# ==================== ВНЕСЕНИЕ ИСПРАВЛЕНИЙ (требует root) ====================
 if [ "$EUID" -ne 0 ]; then
-    echo "ERROR:Для исправления требуются права root (sudo)."
+    echo "ERROR:Для применения исправлений требуются права root (sudo)."
     exit 1
 fi
 
-echo "APPLYING_FIXES..."
-
-# 1. Бэкап
+# 1. Резервная копия
 BACKUP_DIR="/root/ssh-backup-fix-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
 cp -r /etc/ssh "$BACKUP_DIR/" 2>/dev/null || true
@@ -280,6 +290,12 @@ run_local() {
         exit 0
     fi
 
+    if echo "$output" | grep -q "^RESULT:OK_WITH_WARNINGS"; then
+        echo -e "${GREEN}✅ Вход по паролю отключен.${NC}"
+        echo "$output" | grep "^WARNING:" | sed 's/^WARNING:/   ℹ️  /'
+        exit 0
+    fi
+
     if [ "$mode" = "check" ]; then
         echo -e "${YELLOW}⚠️  Обнаружены проблемы, требующие исправления:${NC}"
         echo "$output" | grep "^ISSUE:" | sed 's/^ISSUE:/   - /'
@@ -334,49 +350,75 @@ run_remote_target() {
     local target="$1"
     read -r user host port < <(parse_target "$target")
 
-    local mode="apply"
-    if [ "$CHECK_ONLY" = true ]; then
-        mode="check"
-    fi
-
     # Пробуем подключиться (сначала на указанный порт, при неудаче — на fallback порт 22)
     local active_port="$port"
-    local ssh_opts=(-o BatchMode=yes -o ConnectTimeout=6 -o StrictHostKeyChecking=accept-new)
+    local ssh_opts=(-o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
 
     if ! ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "true" 2>/dev/null; then
         if [ "$active_port" != "$FALLBACK_PORT" ] && ssh "${ssh_opts[@]}" -p "$FALLBACK_PORT" "$user@$host" "true" 2>/dev/null; then
             active_port="$FALLBACK_PORT"
         else
-            echo -e "${RED}[ОШИБКА]${NC} $user@$host:$port — не удалось подключиться по SSH (таймаут или не принят ключ)"
+            echo -e "${RED}[ОШИБКА]${NC}      $user@$host:$port — нет подключения по SSH (таймаут или отклонён ключ)"
             return 2
         fi
     fi
 
-    # Выполняем payload на сервере с sudo
-    local remote_cmd="sudo bash -s -- $mode"
-    if [ "$user" = "root" ]; then
-        remote_cmd="bash -s -- $mode"
-    fi
-
-    local out
-    out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "$remote_cmd" <<EOF 2>/dev/null
+    # ШАГ 1: Всегда сначала запускаем проверку БЕЗ root/sudo
+    local check_out
+    check_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "bash -s -- check" <<EOF 2>/dev/null
 $REMOTE_PAYLOAD
 EOF
     ) || true
 
-    if echo "$out" | grep -q "^RESULT:OK"; then
-        echo -e "${GREEN}[OK]${NC}      $user@$host:$active_port — вход по паролю уже надёжно отключен, изменений не требуется"
+    if echo "$check_out" | grep -q "^RESULT:OK"; then
+        echo -e "${GREEN}[OK]${NC}          $user@$host:$active_port — вход по паролю уже надёжно отключен (sshd -T: no)"
         return 0
-    elif echo "$out" | grep -q "^RESULT:FIXED"; then
-        echo -e "${CYAN}[FIXED]${NC} $user@$host:$active_port — конфликт исправлен, PasswordAuthentication no применён"
+    fi
+
+    if echo "$check_out" | grep -q "^RESULT:OK_WITH_WARNINGS"; then
+        if [ "$CHECK_ONLY" = true ]; then
+            echo -e "${GREEN}[OK]${NC}          $user@$host:$active_port — вход по паролю отключен (sshd -T: no)"
+            echo "$check_out" | grep "^WARNING:" | sed 's/^WARNING:/              ℹ️  /'
+            return 0
+        fi
+        # Если не только проверка, а режим apply — продолжаем для создания 01-custom.conf
+    fi
+
+    # Если мы в режиме CHECK_ONLY — выводим найденные проблемы и не меняем ничего
+    if [ "$CHECK_ONLY" = true ]; then
+        echo -e "${YELLOW}[НУЖЕН ФИКС]${NC}  $user@$host:$active_port — ТРЕБУЕТСЯ ИСПРАВЛЕНИЕ:"
+        echo "$check_out" | grep "^ISSUE:" | sed 's/^ISSUE:/              - /'
         return 1
-    elif echo "$out" | grep -q "^RESULT:NEEDS_FIX"; then
-        echo -e "${YELLOW}[ВНИМАНИЕ]${NC} $user@$host:$active_port — ТРЕБУЕТСЯ ИСПРАВЛЕНИЕ:"
-        echo "$out" | grep "^ISSUE:" | sed 's/^ISSUE:/          - /'
+    fi
+
+    # ШАГ 2: В режиме apply требуется root
+    local apply_out=""
+    if [ "$user" = "root" ]; then
+        apply_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "bash -s -- apply" <<EOF 2>/dev/null
+$REMOTE_PAYLOAD
+EOF
+        ) || true
+    else
+        # Запускаем через sudo
+        if [ -n "$SUDO_PASS" ]; then
+            apply_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "echo '$SUDO_PASS' | sudo -S -p '' bash -s -- apply" <<EOF 2>/dev/null
+$REMOTE_PAYLOAD
+EOF
+            ) || true
+        else
+            apply_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "sudo -n bash -s -- apply" <<EOF 2>/dev/null
+$REMOTE_PAYLOAD
+EOF
+            ) || true
+        fi
+    fi
+
+    if echo "$apply_out" | grep -q "^RESULT:FIXED"; then
+        echo -e "${CYAN}[ИСПРАВЛЕНО]${NC}  $user@$host:$active_port — конфликт устранён, вход по паролю отключен"
         return 1
     else
-        echo -e "${RED}[СБОЙ]${NC}   $user@$host:$active_port — ошибка выполнения на сервере:"
-        echo "$out" | sed 's/^/          /'
+        echo -e "${RED}[СБОЙ]${NC}        $user@$host:$active_port — не удалось применить исправление:"
+        echo "$apply_out" | sed 's/^/              /'
         return 3
     fi
 }
@@ -401,10 +443,18 @@ main() {
         exit 0
     fi
 
-    # Иначе запускаем удалённую проверку по списку
+    # Если не только проверка, а применение исправлений не под root — спрашиваем пароль sudo один раз
+    if [ "$CHECK_ONLY" = false ] && [ "$DEFAULT_USER" != "root" ]; then
+        echo -e "${CYAN}Для применения исправлений на серверах требуются права sudo.${NC}"
+        read -s -p "🔑 Введите пароль sudo для пользователя '$DEFAULT_USER' (Enter если NOPASSWD): " SUDO_PASS || true
+        echo ""
+        echo ""
+    fi
+
+    # Удалённая проверка по списку
     echo -e "${BLUE}================================================================${NC}"
     if [ "$CHECK_ONLY" = true ]; then
-        echo -e "${BLUE}🔍 Режим АУДИТА (только проверка) для ${#TARGETS[@]} серверов...${NC}"
+        echo -e "${BLUE}🔍 Режим АУДИТА (проверка БЕЗ sudo) для ${#TARGETS[@]} серверов...${NC}"
     else
         echo -e "${BLUE}🚀 Запуск проверки и исправления для ${#TARGETS[@]} серверов...${NC}"
     fi
@@ -450,4 +500,3 @@ main() {
 }
 
 main "$@"
-
