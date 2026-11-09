@@ -391,25 +391,21 @@ EOF
         return 1
     fi
 
-    # ШАГ 2: В режиме apply требуется root
-    local apply_out=""
-    if [ "$user" = "root" ]; then
-        apply_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "bash -s -- apply" <<EOF 2>/dev/null
+    # ШАГ 2: В режиме apply требуется root. Передаём скрипт во временный файл
+    local remote_tmp="/tmp/fix_ssh_run_$$.sh"
+    ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "cat > '$remote_tmp' && chmod 700 '$remote_tmp'" <<EOF 2>/dev/null
 $REMOTE_PAYLOAD
 EOF
-        ) || true
+
+    local apply_out=""
+    if [ "$user" = "root" ]; then
+        apply_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "bash '$remote_tmp' apply 2>&1; rm -f '$remote_tmp'" 2>&1) || true
     else
         # Запускаем через sudo
         if [ -n "$SUDO_PASS" ]; then
-            apply_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "echo '$SUDO_PASS' | sudo -S -p '' bash -s -- apply" <<EOF 2>/dev/null
-$REMOTE_PAYLOAD
-EOF
-            ) || true
+            apply_out=$(printf '%s\n' "$SUDO_PASS" | ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "sudo -S -p '' bash '$remote_tmp' apply 2>&1; rm -f '$remote_tmp'" 2>&1) || true
         else
-            apply_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "sudo -n bash -s -- apply" <<EOF 2>/dev/null
-$REMOTE_PAYLOAD
-EOF
-            ) || true
+            apply_out=$(ssh "${ssh_opts[@]}" -p "$active_port" "$user@$host" "sudo -n bash '$remote_tmp' apply 2>&1; rm -f '$remote_tmp'" 2>&1) || true
         fi
     fi
 
