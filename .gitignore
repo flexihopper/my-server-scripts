@@ -1,4 +1,10 @@
 # Byte-compiled / optimized / DLL files
+servers.txt
+servers*.txt
+hosts.txt
+*.pem
+*.key
+
 __pycache__/
 *.py[codz]
 *$py.class
