@@ -166,22 +166,44 @@ fi
 # SSH всё равно поднимется после перезагрузки
 systemctl enable ssh
 
-# 2. Удаляем конфликтующие drop-in конфиги (cloud-init и др.)
-echo "🧹 Очистка drop-in конфигов SSH..."
-if [ -d /etc/ssh/sshd_config.d ]; then
-    # Бэкап на всякий случай (путь вычисляем один раз)
-    BACKUP_DIR="/root/ssh-backup-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-    cp -r /etc/ssh/sshd_config.d "$BACKUP_DIR"/ 2>/dev/null || true
+# 2. Очистка и настройка drop-in конфигов SSH
+# OpenSSH считывает настройки по правилу "FIRST MATCH WINS":
+# Первое найденное значение параметра фиксируется, последующие игнорируются!
+# Так как в начале /etc/ssh/sshd_config есть директива "Include /etc/ssh/sshd_config.d/*.conf",
+# файлы из sshd_config.d читаются в алфавитном порядке ДО основного файла.
+# Поэтому создаём 01-custom.conf (наивысший лексикографический приоритет) и чистим облачные оверрайды.
+echo "🧹 Очистка и подготовка drop-in конфигов SSH..."
+mkdir -p /etc/ssh/sshd_config.d
+BACKUP_DIR="/root/ssh-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+cp -r /etc/ssh/sshd_config.d "$BACKUP_DIR"/ 2>/dev/null || true
 
-    # Удаляем проблемные конфиги
-    rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf
-    rm -f /etc/ssh/sshd_config.d/*cloud*.conf
-    echo "✅ Drop-in конфиги очищены (бэкап сохранён в $BACKUP_DIR)"
-fi
+# Удаляем проблемные облачные конфиги (cloud-init и др.)
+rm -f /etc/ssh/sshd_config.d/50-cloud-init.conf
+rm -f /etc/ssh/sshd_config.d/*cloud*.conf
+echo "✅ Старые drop-in конфиги очищены (бэкап сохранён в $BACKUP_DIR)"
 
-# 3. Правка конфигурации sshd_config
-echo "📝 Изменение основного конфига SSH..."
+# Создаём приоритетный drop-in конфиг 01-custom.conf
+# Благодаря префиксу 01- он загружается первым среди drop-in и имеет приоритет над sshd_config
+cat > /etc/ssh/sshd_config.d/01-custom.conf <<EOF
+# Приоритетная конфигурация SSH (OpenSSH first match wins)
+Port $SSH_PORT
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+KbdInteractiveAuthentication yes
+EOF
+
+# Нейтрализуем конфликтующие директивы в остальных drop-in файлах, если они остались
+for conf in /etc/ssh/sshd_config.d/*.conf; do
+    [ -f "$conf" ] || continue
+    [ "$conf" = "/etc/ssh/sshd_config.d/01-custom.conf" ] && continue
+    sed -i "s/^[# ]*\(Port\|PermitRootLogin\|PasswordAuthentication\|PubkeyAuthentication\|PermitEmptyPasswords\|KbdInteractiveAuthentication\)/# &/" "$conf"
+done
+
+# 3. Синхронизация основного конфига sshd_config
+echo "📝 Синхронизация основного конфига SSH..."
 SSH_BACKUP="/etc/ssh/sshd_config.backup-$(date +%Y%m%d-%H%M%S)"
 cp /etc/ssh/sshd_config "$SSH_BACKUP"
 
@@ -190,6 +212,7 @@ sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin no/" /etc/ssh/sshd_config
 sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication yes/" /etc/ssh/sshd_config
 sed -i "s/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
 sed -i "s/^#\?PermitEmptyPasswords .*/PermitEmptyPasswords no/" /etc/ssh/sshd_config
+sed -i "s/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication yes/" /etc/ssh/sshd_config
 sed -i 's/^ *AcceptEnv.*/# &/' /etc/ssh/sshd_config
 
 # 4. Проверка конфига перед применением
@@ -254,9 +277,21 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
     echo ""
     echo "❌ Откатываем изменения SSH..."
 
-    # Восстанавливаем порт и PermitRootLogin
-    sed -i "s/^#\?Port .*/Port $ORIGINAL_PORT/" /etc/ssh/sshd_config
-    sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin $ORIGINAL_ROOT_LOGIN/" /etc/ssh/sshd_config
+    # Удаляем наш приоритетный drop-in конфиг
+    rm -f /etc/ssh/sshd_config.d/01-custom.conf
+
+    # Восстанавливаем оригинальные drop-in конфиги из бэкапа
+    if [ -d "$BACKUP_DIR" ]; then
+        cp -r "$BACKUP_DIR"/sshd_config.d/* /etc/ssh/sshd_config.d/ 2>/dev/null || true
+    fi
+
+    # Восстанавливаем основной sshd_config
+    if [ -f "$SSH_BACKUP" ]; then
+        cp "$SSH_BACKUP" /etc/ssh/sshd_config
+    else
+        sed -i "s/^#\?Port .*/Port $ORIGINAL_PORT/" /etc/ssh/sshd_config
+        sed -i "s/^#\?PermitRootLogin .*/PermitRootLogin $ORIGINAL_ROOT_LOGIN/" /etc/ssh/sshd_config
+    fi
 
     # Восстанавливаем fail2ban
     sed -i "s/port = $SSH_PORT/port = $ORIGINAL_PORT/" /etc/fail2ban/jail.local
@@ -276,7 +311,7 @@ if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         echo "Скрипт остановлен. Разберитесь с SSH и запустите снова."
     else
         echo "❌ КРИТИЧЕСКАЯ ОШИБКА при откате конфига!"
-        echo "Восстановите вручную из /etc/ssh/sshd_config.backup-*"
+        echo "Восстановите вручную из $SSH_BACKUP и $BACKUP_DIR"
     fi
 
     exit 1
@@ -332,7 +367,14 @@ echo ""
 read -p "🔐 Отключить вход по паролю прямо сейчас? (y/N): " -n 1 -r || REPLY="n"
 echo
 
-if [[ $REPLY =~ ^[Yy]$ ]]; then
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo ""
+    echo "⚠️  ВАЖНО: Вход по паролю ОСТАВЛЕН ВКЛЮЧЕННЫМ!"
+    echo "   Не забудьте отключить его позже вручную:"
+    echo "   1) Установите PasswordAuthentication no в /etc/ssh/sshd_config.d/01-custom.conf"
+    echo "   2) Установите PasswordAuthentication no в /etc/ssh/sshd_config"
+    echo "   3) Проверьте через sshd -T | grep passwordauthentication"
+else
     echo ""
     echo "⚠️  ПОСЛЕДНЕЕ ПРЕДУПРЕЖДЕНИЕ!"
     echo "Если у вас нет рабочего SSH-ключа для пользователя $NEW_USER,"
@@ -341,24 +383,59 @@ if [[ $REPLY =~ ^[Yy]$ ]]; then
     read -p "Вы уверены? Введите 'yes' для подтверждения: " CONFIRMATION
 
     if [ "$CONFIRMATION" = "yes" ]; then
-        sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
+        # 1. Приоритетный drop-in конфиг (first match wins в OpenSSH)
+        mkdir -p /etc/ssh/sshd_config.d
+        cat > /etc/ssh/sshd_config.d/01-custom.conf <<EOF
+# Приоритетная конфигурация SSH (OpenSSH first match wins)
+Port $SSH_PORT
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+EOF
 
+        # 2. Нейтрализуем PasswordAuthentication во ВСЕХ остальных drop-in файлах
+        for conf in /etc/ssh/sshd_config.d/*.conf; do
+            [ -f "$conf" ] || continue
+            [ "$conf" = "/etc/ssh/sshd_config.d/01-custom.conf" ] && continue
+            sed -i "s/^[# ]*PasswordAuthentication .*/PasswordAuthentication no/" "$conf"
+            sed -i "s/^[# ]*KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/" "$conf"
+        done
+
+        # 3. Синхронизируем основной /etc/ssh/sshd_config
+        sed -i "s/^#\?PasswordAuthentication .*/PasswordAuthentication no/" /etc/ssh/sshd_config
+        sed -i "s/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/" /etc/ssh/sshd_config
+
+        # 4. Защита от сброса cloud-init при последующих перезагрузках
+        if [ -d /etc/cloud/cloud.cfg.d ]; then
+            echo "ssh_pwauth: false" > /etc/cloud/cloud.cfg.d/99-disable-ssh-pwauth.cfg
+        fi
+
+        # 5. Проверка синтаксиса и перезапуск службы
         if sshd -t; then
             systemctl restart ssh
-            echo ""
-            echo "✅ Готово! Вход по паролю отключен."
-            echo "   Доступ только по SSH-ключам."
+
+            # 6. Проверка РЕАЛЬНОГО активного значения через sshd -T (first match wins)
+            EFFECTIVE_PW_AUTH=$(sshd -T | grep -Ei '^passwordauthentication ' | awk '{print $2}')
+            if [ "$EFFECTIVE_PW_AUTH" = "no" ]; then
+                echo ""
+                echo "✅ Готово! Вход по паролю успешно отключен."
+                echo "   Активная конфигурация подтверждена (sshd -T: PasswordAuthentication no)."
+                echo "   Доступ только по SSH-ключам."
+            else
+                echo ""
+                echo "⚠️  ВНИМАНИЕ: sshd -T всё ещё сообщает: PasswordAuthentication $EFFECTIVE_PW_AUTH!"
+                echo "   Один из файлов переопределяет параметр из-за правила first match wins."
+                echo "   Найденные строки с PasswordAuthentication в /etc/ssh/:"
+                grep -rnEi "^[# ]*PasswordAuthentication" /etc/ssh/ || true
+            fi
         else
             echo "❌ Ошибка в конфигурации! Изменения не применены."
         fi
     else
         echo "❌ Отменено. Вход по паролю оставлен включённым."
     fi
-else
-    echo ""
-    echo "⚠️  ВАЖНО: Вход по паролю ОСТАВЛЕН ВКЛЮЧЕННЫМ!"
-    echo "   Не забудьте отключить его позже вручную."
-    echo "   (PasswordAuthentication no в /etc/ssh/sshd_config)"
 fi
 
 echo ""

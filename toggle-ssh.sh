@@ -23,9 +23,14 @@ if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
     ufw allow "${TARGET_PORT}/tcp" >/dev/null
 fi
 
-# 2. Обновляем конфигурацию sshd (через drop-in файл и основной конфиг)
+# 2. Обновляем конфигурацию sshd (через drop-in файлы и основной конфиг)
+# В OpenSSH действует правило FIRST MATCH WINS, поэтому префикс 01- имеет приоритет над остальными drop-in
 mkdir -p /etc/ssh/sshd_config.d
-echo "Port ${TARGET_PORT}" > /etc/ssh/sshd_config.d/99-custom-port.conf
+if [[ -f /etc/ssh/sshd_config.d/01-custom.conf ]]; then
+    sed -i -E "s/^Port .*/Port ${TARGET_PORT}/" /etc/ssh/sshd_config.d/01-custom.conf
+fi
+echo "Port ${TARGET_PORT}" > /etc/ssh/sshd_config.d/01-custom-port.conf
+rm -f /etc/ssh/sshd_config.d/99-custom-port.conf
 
 if grep -qE "^Port " /etc/ssh/sshd_config; then
     sed -i -E "s/^Port .*/Port ${TARGET_PORT}/" /etc/ssh/sshd_config
@@ -34,6 +39,7 @@ fi
 # Проверка конфигурации перед применением
 if ! sshd -t; then
     echo "Ошибка: проверка sshd -t не прошла! Откат изменений..."
+    rm -f /etc/ssh/sshd_config.d/01-custom-port.conf
     rm -f /etc/ssh/sshd_config.d/99-custom-port.conf
     exit 1
 fi
