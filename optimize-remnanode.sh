@@ -1,71 +1,122 @@
 #!/bin/bash
 
 # =============================================================
-#   Оптимизация хоста для Remnawave / Remnanode (Docker)
-#   Адаптация по RAM + CPU | Ubuntu/Debian | Требует: sudo
+#   Оптимизация хоста для Remnawave / Remnanode (Docker, host-network)
+#   Ubuntu/Debian | Требует: root
+#   Основа: flexihopper/my-server-scripts (optimize-remnanode.sh), v2 с правками
 #
-#   В отличие от версии под 3x-ui, здесь НЕТ привязки к
-#   systemd-юниту "x-ui" — Remnanode работает в Docker
-#   (network_mode: host), поэтому:
-#     - NOFILE/логи уже настроены в docker-compose.yml (ulimits, json-file)
-#     - OOM-приоритет ставится через `docker update`, не через systemd override
-#     - Все sysctl-настройки применяются к хосту напрямую,
-#       т.к. host-network контейнер использует сетевой стек хоста
+#   Запуск:
+#     sudo bash optimize-remnanode.sh
+#     sudo DISABLE_IPV6=0 bash optimize-remnanode.sh      # оставить IPv6
+#     sudo SWAP_SIZE_MB=2048 bash optimize-remnanode.sh   # другой размер swap
+#
+#   Что изменено относительно оригинала:
+#    - Нет `set -e`: сбой одного блока (swapon на LXC и т.п.) не рвёт весь скрипт
+#    - BBR определяется через tcp_available_congestion_control
+#      (работает и когда BBR вкомпилен в ядро)
+#    - Swap: если в системе уже есть любой swap — новый не создаётся
+#    - ip_local_port_range 10240-65535 (не пересекается с портами inbound'ов)
+#    - tcp_fin_timeout=10, conntrack close_wait=30 (без чрезмерной агрессии)
+#    - TSO/GSO больше НЕ отключаются; если старая версия их отключила — вернёт on
+#    - IPv6: только через sysctl (флаг DISABLE_IPV6), GRUB не трогаем
+#    - Убраны: IRQ affinity, I/O scheduler (на VPS бесполезны / вредны)
+#    - RPS/RFS только для интерфейсов с одной rx-очередью, flow_cnt считается верно
+#    - Governor/THP переживают ребут через systemd-юнит, а не rc.local
+#    - Чистятся артефакты предыдущей версии скрипта
 #
 #   Блоки:
+#    0.  Бэкап и очистка артефактов старой версии
 #    1.  Определение ресурсов (RAM + CPU профили)
-#    2.  Загрузка модулей ядра
+#    2.  Модули ядра / BBR
 #    3.  Swap
-#    4.  Sysctl (TCP/BBR/память/conntrack)
+#    4.  Sysctl
 #    5.  RPS / RFS
-#    6.  CPU Governor -> performance
-#    7.  IRQ Affinity
-#    8.  NIC Offloading (TSO/GRO/GSO)
-#    9.  THP — отключение Transparent HugePages
-#   10.  Disk I/O Scheduler
-#   11.  Conntrack hashsize
-#   12.  GRUB — отключение IPv6
-#   13.  OOM-приоритет для контейнеров remnanode/caddy
+#    6.  CPU governor + THP (systemd-юнит)
+#    7.  Conntrack hashsize
+#    8.  IPv6 / GRUB (только подсказки)
+#    9.  OOM-приоритет контейнеров (инструкция)
 # =============================================================
 
-set -euo pipefail
+set -uo pipefail
 
 if [[ $EUID -ne 0 ]]; then
     echo "Ошибка: запустите через sudo"
     exit 1
 fi
 
+DISABLE_IPV6="${DISABLE_IPV6:-1}"
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-1024}"
+
+ok()   { echo "    [+] $*"; }
+skip() { echo "    [~] $*"; }
+warn() { echo "    [!] $*"; }
+
+is_skip_iface() {
+    case "$1" in
+        lo|docker*|veth*|br-*|virbr*|tun*|tap*|wg*|warp*) return 0 ;;
+    esac
+    return 1
+}
+
+# ─────────────────────────────────────────────
+# 0. БЭКАП И ОЧИСТКА СТАРОЙ ВЕРСИИ
+# ─────────────────────────────────────────────
+BACKUP=/root/sysctl-before-remnanode-tuning.txt
+[ -f "$BACKUP" ] || sysctl -a > "$BACKUP" 2>/dev/null || true
+
+echo "[*] Проверяю артефакты предыдущей версии скрипта..."
+
+RC_LOCAL=/etc/rc.local
+if [ -f "$RC_LOCAL" ] && grep -qE 'remnanode-|scaling_governor|transparent_hugepage' "$RC_LOCAL"; then
+    cp -n "$RC_LOCAL" /root/rc.local.bak-remnanode 2>/dev/null || true
+    sed -i \
+        -e '\|remnanode-|d' \
+        -e '\|cpu\*/cpufreq/scaling_governor; do|d' \
+        -e '\|transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do|d' \
+        "$RC_LOCAL"
+    ok "Строки старого скрипта удалены из rc.local (бэкап: /root/rc.local.bak-remnanode)"
+fi
+
+if [ -f /usr/local/bin/remnanode-nic-offload.sh ]; then
+    if grep -q "tso off" /usr/local/bin/remnanode-nic-offload.sh && command -v ethtool &>/dev/null; then
+        for P in /sys/class/net/*/; do
+            N=$(basename "$P")
+            is_skip_iface "$N" && continue
+            ethtool -K "$N" tso on gso on gro on 2>/dev/null || true
+        done
+        ok "TSO/GSO возвращены в on (старая версия их отключала)"
+    fi
+    rm -f /usr/local/bin/remnanode-nic-offload.sh
+fi
+rm -f /usr/local/bin/remnanode-irq-affinity.sh /etc/udev/rules.d/60-remnanode-ioscheduler.rules
+
 # ─────────────────────────────────────────────
 # 1. ОПРЕДЕЛЕНИЕ РЕСУРСОВ
 # ─────────────────────────────────────────────
 TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
 CPU_CORES=$(nproc)
-CPU_MASK=$(printf '%x' $(( (1 << CPU_CORES) - 1 )))
 
 echo ""
 echo "========================================"
-echo "   Remnanode Host Optimizer"
+echo "   Remnanode Host Optimizer (v2)"
 echo "========================================"
-echo "  RAM: ${TOTAL_RAM_MB}MB | CPU: ${CPU_CORES} cores (mask: 0x${CPU_MASK})"
+echo "  RAM: ${TOTAL_RAM_MB}MB | CPU: ${CPU_CORES} cores"
 echo "========================================"
 
 if [ "$TOTAL_RAM_MB" -lt 1536 ]; then
     RAM_TIER="1GB"
     CONNTRACK=131072;  HASHSIZE=32768
     BUFF_MAX=16777216; BUFF_TCP="4096 87380 16777216"
-    FIN_TIMEOUT=7
     MAX_ORPHANS=16384; TW_BUCKETS=262144
 elif [ "$TOTAL_RAM_MB" -lt 3840 ]; then
     RAM_TIER="2-3GB"
     CONNTRACK=262144;  HASHSIZE=65536
     BUFF_MAX=33554432; BUFF_TCP="4096 87380 33554432"
-    FIN_TIMEOUT=5
     MAX_ORPHANS=32768; TW_BUCKETS=524288
 else
     RAM_TIER="4GB+"
     CONNTRACK=524288;  HASHSIZE=131072
     BUFF_MAX=67108864; BUFF_TCP="4096 87380 67108864"
-    FIN_TIMEOUT=3
     MAX_ORPHANS=65536; TW_BUCKETS=720000
 fi
 
@@ -96,59 +147,79 @@ echo "  CPU профиль : $CPU_TIER"
 echo "========================================"
 
 # ─────────────────────────────────────────────
-# 2. ЗАГРУЗКА МОДУЛЕЙ ЯДРА
+# 2. МОДУЛИ ЯДРА / BBR
 # ─────────────────────────────────────────────
 echo "[*] Загружаю модули ядра..."
-modprobe tcp_bbr      2>/dev/null && echo "    [+] tcp_bbr"      || echo "    [!] tcp_bbr недоступен -> cubic"
-modprobe nf_conntrack 2>/dev/null && echo "    [+] nf_conntrack"
+modprobe tcp_bbr      2>/dev/null || true
+modprobe nf_conntrack 2>/dev/null || true
 
-cat <<EOF > /etc/modules-load.d/remnanode-modules.conf
-tcp_bbr
-nf_conntrack
-EOF
+if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    TCP_CC="bbr"
+    ok "BBR доступен"
+else
+    TCP_CC="cubic"
+    warn "BBR недоступен -> cubic"
+fi
+
+: > /etc/modules-load.d/remnanode-modules.conf
+modinfo tcp_bbr      &>/dev/null && echo "tcp_bbr"      >> /etc/modules-load.d/remnanode-modules.conf
+modinfo nf_conntrack &>/dev/null && echo "nf_conntrack" >> /etc/modules-load.d/remnanode-modules.conf
 
 # ─────────────────────────────────────────────
 # 3. SWAP
+#    Создаём только если в системе нет НИКАКОГО swap
+#    (раздел, /swap.img, zram, чужой swapfile — всё считается)
 # ─────────────────────────────────────────────
-if ! swapon --show | grep -q '/swapfile'; then
-    if [ ! -f /swapfile ]; then
-        echo "[*] Создаю swap-файл 1GB..."
-        fallocate -l 1G /swapfile
-        chmod 600 /swapfile
-        mkswap /swapfile
-    else
-        echo "[*] /swapfile существует, подключаю..."
-    fi
-    swapon /swapfile
-    grep -qxF '/swapfile none swap sw 0 0' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    echo "    [+] Swap подключён"
+echo "[*] Проверяю swap..."
+SWAP_DEVICES=$(swapon --noheadings --show=NAME 2>/dev/null | wc -l)
+
+if [ "$SWAP_DEVICES" -gt 0 ]; then
+    skip "Swap уже есть: $(swapon --noheadings --show=NAME,SIZE 2>/dev/null | tr -s ' ' | tr '\n' ';') — новый не создаю"
 else
-    echo "    [~] Swap уже активен"
+    CREATED=0
+    if [ ! -f /swapfile ]; then
+        echo "    [*] Создаю swap-файл ${SWAP_SIZE_MB}MB..."
+        if ! fallocate -l "${SWAP_SIZE_MB}M" /swapfile 2>/dev/null; then
+            dd if=/dev/zero of=/swapfile bs=1M count="$SWAP_SIZE_MB" status=none 2>/dev/null
+        fi
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null 2>&1
+        CREATED=1
+    fi
+    if swapon /swapfile 2>/dev/null; then
+        grep -qxF '/swapfile none swap sw 0 0' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        ok "Swap подключён"
+    else
+        warn "swapon не удался (LXC/OpenVZ или ограничения ФС) — swap пропущен"
+        [ "$CREATED" -eq 1 ] && rm -f /swapfile
+    fi
 fi
 
 # ─────────────────────────────────────────────
-# 4. SYSCTL — TCP / BBR / ПАМЯТЬ / CONNTRACK
-#    ВАЖНО: используем ОДИН файл, чтобы не конфликтовать с
-#    sysctl-файлом, который мог накатить install_remnawave.sh
-#    (проверь после запуска: sysctl net.ipv4.tcp_congestion_control)
+# 4. SYSCTL
 # ─────────────────────────────────────────────
 echo "[*] Применяю sysctl..."
 
-grep -q "tcp_bbr" /proc/modules 2>/dev/null && TCP_CC="bbr" || TCP_CC="cubic"
-
-# убираем возможный старый файл от eGamesAPI-скрипта, чтобы не спорил порядком применения
 if [ -f /etc/sysctl.d/98-remnawave.conf ]; then
-    echo "    [~] Найден /etc/sysctl.d/98-remnawave.conf (от install-скрипта) — объединяю с ним"
+    skip "Найден /etc/sysctl.d/98-remnawave.conf — наш файл 99-* грузится позже и перекрывает совпадающие ключи"
+fi
+
+IPV6_BLOCK=""
+if [ "$DISABLE_IPV6" = "1" ]; then
+    IPV6_BLOCK="# --- Отключение IPv6 (DISABLE_IPV6=1) ---
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1"
 fi
 
 cat <<EOF > /etc/sysctl.d/99-remnanode-tuning.conf
-# Remnanode Host Tuning | RAM: $RAM_TIER | CPU: $CPU_TIER
+# Remnanode Host Tuning v2 | RAM: $RAM_TIER | CPU: $CPU_TIER
 
 # --- Conntrack ---
 net.netfilter.nf_conntrack_max = $CONNTRACK
 net.netfilter.nf_conntrack_tcp_timeout_established = 3600
 net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
-net.netfilter.nf_conntrack_tcp_timeout_close_wait = 15
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 30
 net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 30
 net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 30
@@ -169,7 +240,7 @@ net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 
 # --- TCP ---
-net.ipv4.tcp_fin_timeout = $FIN_TIMEOUT
+net.ipv4.tcp_fin_timeout = 10
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_keepalive_time = 300
 net.ipv4.tcp_keepalive_intvl = 30
@@ -186,7 +257,8 @@ net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_max_syn_backlog = $SYN_BACKLOG
 net.core.netdev_max_backlog = $NETDEV_BACKLOG
 net.core.somaxconn = $SOMAXCONN
-net.ipv4.ip_local_port_range = 1024 65535
+# Эфемерные порты начинаются с 10240, чтобы не пересекаться с портами inbound'ов
+net.ipv4.ip_local_port_range = 10240 65535
 net.core.rps_sock_flow_entries = $FLOW_ENTRIES
 
 # --- Защита ---
@@ -202,310 +274,186 @@ vm.vfs_cache_pressure = 50
 vm.dirty_ratio = 15
 vm.dirty_background_ratio = 5
 
-# --- Отключение IPv6 (защита от лика мимо туннеля) ---
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
+$IPV6_BLOCK
 EOF
 
-sysctl -p /etc/sysctl.d/99-remnanode-tuning.conf 2>&1 | grep -v "No such file" || true
-echo "    [+] sysctl применён (TCP CC: $TCP_CC)"
-echo "    [i] Проверь итоговое значение: sysctl net.ipv4.tcp_congestion_control net.core.rmem_max"
+sysctl -p /etc/sysctl.d/99-remnanode-tuning.conf 2>&1 | grep -vE "No such file|cannot stat" || true
+ok "sysctl применён (TCP CC: $TCP_CC)"
 
 # ─────────────────────────────────────────────
 # 5. RPS / RFS
+#    Только для интерфейсов с ОДНОЙ rx-очередью: при нескольких
+#    очередях (virtio multiqueue, физические NIC) их уже раскидывает RSS.
 # ─────────────────────────────────────────────
 if [ "$RPS_ENABLED" -eq 1 ]; then
-    echo "[*] Настраиваю RPS/RFS (${CPU_CORES} ядер, mask=0x${CPU_MASK})..."
+    echo "[*] Настраиваю RPS/RFS..."
 
-    FLOW_PER_QUEUE=$(( FLOW_ENTRIES / CPU_CORES ))
-    FLOW_PER_QUEUE_P2=1
-    while [ "$FLOW_PER_QUEUE_P2" -lt "$FLOW_PER_QUEUE" ]; do
-        FLOW_PER_QUEUE_P2=$(( FLOW_PER_QUEUE_P2 * 2 ))
-    done
+    cat <<'SCRIPT' > /usr/local/bin/remnanode-rps-apply.sh
+#!/bin/bash
+# RPS/RFS для интерфейса с одной rx-очередью
+IFACE="$1"
+case "$IFACE" in lo|docker*|veth*|br-*|virbr*|tun*|tap*|wg*|warp*) exit 0 ;; esac
+FLOW=__FLOW__
+CORES=$(nproc)
+[ "$CORES" -le 1 ] && exit 0
+[ "$CORES" -gt 32 ] && exit 0
+QDIR="/sys/class/net/${IFACE}/queues"
+[ -d "$QDIR" ] || exit 0
+QUEUES=$(ls -d "${QDIR}"/rx-* 2>/dev/null | wc -l)
+[ "$QUEUES" -eq 1 ] || exit 0
+MASK=$(printf '%x' $(( (1 << CORES) - 1 )))
+echo "$MASK" > "${QDIR}/rx-0/rps_cpus"     2>/dev/null
+echo "$FLOW" > "${QDIR}/rx-0/rps_flow_cnt" 2>/dev/null
+exit 0
+SCRIPT
+    sed -i "s/__FLOW__/${FLOW_ENTRIES}/" /usr/local/bin/remnanode-rps-apply.sh
+    chmod +x /usr/local/bin/remnanode-rps-apply.sh
 
-    for IFACE_PATH in /sys/class/net/*/; do
-        IFACE_NAME=$(basename "$IFACE_PATH")
-        [ "$IFACE_NAME" = "lo" ] && continue
-        [[ "$IFACE_NAME" =~ ^(docker|veth|br-|virbr|tun|tap) ]] && continue
-        APPLIED=0
-        for F in "${IFACE_PATH}queues/rx-"*/rps_cpus;    do [ -f "$F" ] && echo "$CPU_MASK"          > "$F" && APPLIED=1; done
-        for F in "${IFACE_PATH}queues/rx-"*/rps_flow_cnt; do [ -f "$F" ] && echo "$FLOW_PER_QUEUE_P2" > "$F"; done
-        [ "$APPLIED" -eq 1 ] && echo "    [+] $IFACE_NAME -> rps_cpus=0x${CPU_MASK}, flow_cnt=${FLOW_PER_QUEUE_P2}"
-    done
-
-    cat <<EOF > /etc/udev/rules.d/99-remnanode-rps.rules
+    cat <<'EOF' > /etc/udev/rules.d/99-remnanode-rps.rules
 ACTION=="add", SUBSYSTEM=="net", RUN+="/usr/local/bin/remnanode-rps-apply.sh %k"
 EOF
-    cat <<SCRIPT > /usr/local/bin/remnanode-rps-apply.sh
-#!/bin/bash
-IFACE="\$1"
-case "\$IFACE" in lo|docker*|veth*|br-*|virbr*|tun*|tap*) exit 0 ;; esac
-for F in /sys/class/net/\${IFACE}/queues/rx-*/rps_cpus;    do [ -f "\$F" ] && echo "${CPU_MASK}"          > "\$F"; done
-for F in /sys/class/net/\${IFACE}/queues/rx-*/rps_flow_cnt; do [ -f "\$F" ] && echo "${FLOW_PER_QUEUE_P2}" > "\$F"; done
-SCRIPT
-    chmod +x /usr/local/bin/remnanode-rps-apply.sh
-    echo "    [+] udev правило сохранено"
-else
-    echo "    [~] RPS/RFS пропущен (1 ядро)"
-fi
 
-# ─────────────────────────────────────────────
-# 6. CPU GOVERNOR -> performance
-# ─────────────────────────────────────────────
-echo "[*] Настраиваю CPU Governor..."
-
-RC_LOCAL="/etc/rc.local"
-if [ ! -f "$RC_LOCAL" ]; then
-    echo '#!/bin/bash' > "$RC_LOCAL"
-    echo 'exit 0' >> "$RC_LOCAL"
-    chmod +x "$RC_LOCAL"
-fi
-
-GOV_APPLIED=0
-if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
-    for CPU_PATH in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-        [ -f "$CPU_PATH" ] && echo "performance" > "$CPU_PATH" && GOV_APPLIED=1
-    done
-    [ "$GOV_APPLIED" -eq 1 ] && echo "    [+] Governor -> performance (все ядра)"
-    if ! grep -q "scaling_governor" "$RC_LOCAL"; then
-        sed -i '/^exit 0/i for F in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f "$F" ] \&\& echo performance > "$F"; done' "$RC_LOCAL"
-    fi
-    command -v cpupower &>/dev/null && cpupower frequency-set -g performance &>/dev/null || true
-else
-    echo "    [~] cpufreq недоступен (виртуальная среда без управления частотой — обычно так и есть на VPS)"
-fi
-
-# ─────────────────────────────────────────────
-# 7. IRQ AFFINITY
-# ─────────────────────────────────────────────
-if [ "$CPU_CORES" -gt 1 ]; then
-    echo "[*] Настраиваю IRQ Affinity..."
-    IRQ_APPLIED=0
     for IFACE_PATH in /sys/class/net/*/; do
-        IFACE_NAME=$(basename "$IFACE_PATH")
-        [ "$IFACE_NAME" = "lo" ] && continue
-        [[ "$IFACE_NAME" =~ ^(docker|veth|br-|virbr|tun|tap) ]] && continue
-        IRQ_DIR="${IFACE_PATH}device/msi_irqs"
-        if [ -d "$IRQ_DIR" ]; then
-            IRQ_NUM=0
-            for IRQ in "$IRQ_DIR"/*; do
-                IRQ_ID=$(basename "$IRQ")
-                TARGET_CPU=$(( IRQ_NUM % CPU_CORES ))
-                [ "$CPU_CORES" -gt 2 ] && [ "$TARGET_CPU" -eq 0 ] && TARGET_CPU=1
-                AFFINITY=$(printf '%x' $(( 1 << TARGET_CPU )))
-                [ -f "/proc/irq/${IRQ_ID}/smp_affinity" ] && echo "$AFFINITY" > "/proc/irq/${IRQ_ID}/smp_affinity" 2>/dev/null && IRQ_APPLIED=$(( IRQ_APPLIED + 1 )) || true
-                IRQ_NUM=$(( IRQ_NUM + 1 ))
-            done
-            [ "$IRQ_APPLIED" -gt 0 ] && echo "    [+] $IFACE_NAME -> ${IRQ_APPLIED} IRQ распределено по ядрам"
-        fi
-    done
-    [ "$IRQ_APPLIED" -eq 0 ] && echo "    [~] MSI IRQ недоступны (частая ситуация на VPS) — пропущено"
-
-    cat <<'IRQSCRIPT' > /usr/local/bin/remnanode-irq-affinity.sh
-#!/bin/bash
-CPU_CORES=$(nproc)
-[ "$CPU_CORES" -le 1 ] && exit 0
-for IFACE_PATH in /sys/class/net/*/; do
-    IFACE_NAME=$(basename "$IFACE_PATH")
-    case "$IFACE_NAME" in lo|docker*|veth*|br-*|virbr*|tun*|tap*) continue ;; esac
-    IRQ_DIR="${IFACE_PATH}device/msi_irqs"
-    [ -d "$IRQ_DIR" ] || continue
-    IRQ_NUM=0
-    for IRQ in "$IRQ_DIR"/*; do
-        IRQ_ID=$(basename "$IRQ")
-        TARGET_CPU=$(( IRQ_NUM % CPU_CORES ))
-        [ "$CPU_CORES" -gt 2 ] && [ "$TARGET_CPU" -eq 0 ] && TARGET_CPU=1
-        AFFINITY=$(printf '%x' $(( 1 << TARGET_CPU )))
-        [ -f "/proc/irq/${IRQ_ID}/smp_affinity" ] && echo "$AFFINITY" > "/proc/irq/${IRQ_ID}/smp_affinity" 2>/dev/null || true
-        IRQ_NUM=$(( IRQ_NUM + 1 ))
-    done
-done
-IRQSCRIPT
-    chmod +x /usr/local/bin/remnanode-irq-affinity.sh
-    if ! grep -q "irq-affinity" "$RC_LOCAL" 2>/dev/null; then
-        sed -i '/^exit 0/i /usr/local/bin/remnanode-irq-affinity.sh' "$RC_LOCAL"
-    fi
-else
-    echo "    [~] IRQ Affinity пропущен (1 ядро)"
-fi
-
-# ─────────────────────────────────────────────
-# 8. NIC OFFLOADING (TSO / GRO / GSO)
-# ─────────────────────────────────────────────
-echo "[*] Настраиваю NIC Offloading..."
-
-IS_VIRTUAL=0
-if systemd-detect-virt --quiet 2>/dev/null; then
-    IS_VIRTUAL=1
-    VIRT_TYPE=$(systemd-detect-virt 2>/dev/null || echo "unknown")
-    echo "    [~] Виртуализация обнаружена: $VIRT_TYPE"
-fi
-
-NIC_SCRIPT="/usr/local/bin/remnanode-nic-offload.sh"
-echo '#!/bin/bash' > "$NIC_SCRIPT"
-echo 'command -v ethtool &>/dev/null || exit 0' >> "$NIC_SCRIPT"
-
-NIC_APPLIED=0
-if command -v ethtool &>/dev/null; then
-    for IFACE_PATH in /sys/class/net/*/; do
-        IFACE_NAME=$(basename "$IFACE_PATH")
-        [ "$IFACE_NAME" = "lo" ] && continue
-        [[ "$IFACE_NAME" =~ ^(tun|tap|veth|docker|br-|virbr) ]] && continue
-
-        if [ "$IS_VIRTUAL" -eq 0 ]; then
-            ethtool -K "$IFACE_NAME" tso on  gso on  gro on  2>/dev/null || true
-            echo "    [+] $IFACE_NAME -> TSO/GSO/GRO включены (физический сервер)"
-            echo "ethtool -K $IFACE_NAME tso on  gso on  gro on  2>/dev/null || true" >> "$NIC_SCRIPT"
+        N=$(basename "$IFACE_PATH")
+        is_skip_iface "$N" && continue
+        /usr/local/bin/remnanode-rps-apply.sh "$N"
+        Q=$(ls -d "${IFACE_PATH}queues"/rx-* 2>/dev/null | wc -l)
+        if [ "$Q" -eq 1 ]; then
+            ok "$N: 1 rx-очередь -> RPS/RFS включён"
         else
-            ethtool -K "$IFACE_NAME" tso off gso off gro on  2>/dev/null || true
-            echo "    [+] $IFACE_NAME -> TSO/GSO выкл, GRO вкл (виртуальная среда)"
-            echo "ethtool -K $IFACE_NAME tso off gso off gro on  2>/dev/null || true" >> "$NIC_SCRIPT"
+            skip "$N: rx-очередей=$Q — RPS не нужен"
         fi
-        NIC_APPLIED=1
     done
-fi
-[ "$NIC_APPLIED" -eq 0 ] && echo "    [~] ethtool недоступен — пропущено (apt install ethtool)"
-chmod +x "$NIC_SCRIPT"
-if ! grep -q "nic-offload" "$RC_LOCAL" 2>/dev/null; then
-    sed -i '/^exit 0/i /usr/local/bin/remnanode-nic-offload.sh' "$RC_LOCAL"
+else
+    skip "RPS/RFS пропущен (1 ядро)"
+    rm -f /etc/udev/rules.d/99-remnanode-rps.rules /usr/local/bin/remnanode-rps-apply.sh
 fi
 
 # ─────────────────────────────────────────────
-# 9. THP — ОТКЛЮЧЕНИЕ TRANSPARENT HUGEPAGES
+# 6. CPU GOVERNOR + THP (systemd-юнит вместо rc.local)
 # ─────────────────────────────────────────────
-echo "[*] Отключаю Transparent HugePages..."
+echo "[*] Настраиваю CPU governor и THP..."
+
+cat <<'EOF' > /usr/local/bin/remnanode-boot.sh
+#!/bin/bash
+for F in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [ -w "$F" ] && echo performance > "$F" 2>/dev/null
+done
+for F in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do
+    [ -w "$F" ] && echo never > "$F" 2>/dev/null
+done
+exit 0
+EOF
+chmod +x /usr/local/bin/remnanode-boot.sh
+
+if command -v systemctl &>/dev/null && [ -d /run/systemd/system ]; then
+    cat <<'EOF' > /etc/systemd/system/remnanode-boot.service
+[Unit]
+Description=Remnanode host tuning (CPU governor, THP)
+After=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/remnanode-boot.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now remnanode-boot.service >/dev/null 2>&1 \
+        && ok "Юнит remnanode-boot.service включён" \
+        || { warn "Не удалось включить юнит, применяю один раз вручную"; /usr/local/bin/remnanode-boot.sh; }
+else
+    warn "systemd не найден — применяю один раз, после ребута настройка не сохранится"
+    /usr/local/bin/remnanode-boot.sh
+fi
 
 THP_APPLIED=0
-for THP_PATH in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag \
-                /sys/kernel/mm/redhat_transparent_hugepage/enabled /sys/kernel/mm/redhat_transparent_hugepage/defrag; do
-    if [ -f "$THP_PATH" ]; then
-        echo "never" > "$THP_PATH"
-        THP_APPLIED=1
-    fi
-done
-
-if [ "$THP_APPLIED" -eq 1 ]; then
-    echo "    [+] THP -> never"
+if grep -q '\[never\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null; then
+    THP_APPLIED=1
+    ok "THP -> never"
 else
-    echo "    [~] THP файлы не найдены (частая ситуация в контейнеризированных VPS-ядрах)"
+    skip "THP не изменён (файлы недоступны)"
 fi
 
-if ! grep -q "transparent_hugepage" "$RC_LOCAL" 2>/dev/null; then
-    sed -i '/^exit 0/i for F in /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag; do [ -f "$F" ] \&\& echo never > "$F"; done' "$RC_LOCAL"
+if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
+    ok "Governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)"
+else
+    skip "cpufreq недоступен (обычно так и есть на VPS)"
 fi
 
 # ─────────────────────────────────────────────
-# 10. DISK I/O SCHEDULER
+# 7. CONNTRACK HASHSIZE
 # ─────────────────────────────────────────────
-echo "[*] Настраиваю Disk I/O Scheduler..."
-
-IO_APPLIED=0
-for DISK in /sys/block/*/; do
-    DISK_NAME=$(basename "$DISK")
-    [[ "$DISK_NAME" =~ ^(loop|ram|dm|md|sr) ]] && continue
-    SCHED_FILE="${DISK}queue/scheduler"
-    [ -f "$SCHED_FILE" ] || continue
-
-    CURRENT_SCHED=$(cat "$SCHED_FILE")
-    ROTATIONAL=$(cat "${DISK}queue/rotational" 2>/dev/null || echo "1")
-
-    if [ "$ROTATIONAL" -eq 0 ]; then
-        if echo "$CURRENT_SCHED" | grep -q "none"; then
-            echo "none" > "$SCHED_FILE" 2>/dev/null || true
-            echo "    [+] $DISK_NAME (SSD/NVMe) -> none"
-        elif echo "$CURRENT_SCHED" | grep -q "mq-deadline"; then
-            echo "mq-deadline" > "$SCHED_FILE" 2>/dev/null || true
-            echo "    [+] $DISK_NAME (SSD) -> mq-deadline"
-        fi
-    else
-        if echo "$CURRENT_SCHED" | grep -q "mq-deadline"; then
-            echo "mq-deadline" > "$SCHED_FILE" 2>/dev/null || true
-            echo "    [+] $DISK_NAME (HDD) -> mq-deadline"
-        fi
-    fi
-    IO_APPLIED=1
-done
-[ "$IO_APPLIED" -eq 0 ] && echo "    [~] Блочные устройства не найдены"
-
-cat <<'EOF' > /etc/udev/rules.d/60-remnanode-ioscheduler.rules
-ACTION=="add|change", KERNEL=="sd[a-z]|nvme[0-9]n[0-9]|vd[a-z]", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
-ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline"
-EOF
-
-# ─────────────────────────────────────────────
-# 11. CONNTRACK HASHSIZE
-# ─────────────────────────────────────────────
+echo "[*] Conntrack hashsize..."
 if [ -f /sys/module/nf_conntrack/parameters/hashsize ]; then
     if echo "$HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null; then
-        echo "    [+] Conntrack hashsize: $HASHSIZE"
+        ok "hashsize: $HASHSIZE"
     else
-        echo "    [~] Не удалось изменить hashsize на лету (модуль уже активен) — применится после перезагрузки"
+        skip "Не удалось изменить hashsize на лету — применится после перезагрузки"
     fi
     echo "options nf_conntrack hashsize=$HASHSIZE" > /etc/modprobe.d/nf_conntrack.conf
 else
-    echo "    [~] nf_conntrack параметры недоступны — пропущено"
+    skip "nf_conntrack параметры недоступны — пропущено"
 fi
 
 # ─────────────────────────────────────────────
-# 12. GRUB — IPv6 OFF
+# 8. IPv6 / GRUB — только подсказки, GRUB не трогаем
 # ─────────────────────────────────────────────
-if [ -f /etc/default/grub ]; then
-    if ! grep -q "ipv6.disable=1" /etc/default/grub; then
-        echo "[*] Отключаю IPv6 в GRUB..."
-        sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 ipv6.disable=1"/' /etc/default/grub
-        update-grub 2>/dev/null || grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null || true
-        echo "    [+] IPv6 отключён в GRUB"
+if [ -f /etc/default/grub ] && grep -q "ipv6.disable=1" /etc/default/grub; then
+    if [ "$DISABLE_IPV6" = "1" ]; then
+        skip "В GRUB остался ipv6.disable=1 от старой версии — он дублирует sysctl, можно убрать:"
     else
-        echo "    [~] IPv6 в GRUB уже отключён"
+        warn "В GRUB остался ipv6.disable=1 от старой версии, IPv6 после ребута останется выключенным. Убрать:"
     fi
+    echo "          sed -i 's/ ipv6.disable=1//' /etc/default/grub && update-grub"
 fi
 
 # ─────────────────────────────────────────────
-# 13. OOM-ПРИОРИТЕТ ДЛЯ КОНТЕЙНЕРОВ remnanode/caddy
-#     ВАЖНО: `docker update --oom-score-adj` НЕ поддерживается Docker —
-#     флаг применяется только при СОЗДАНИИ контейнера (docker run/create
-#     или ключ oom_score_adj в docker-compose.yml), не через update.
-#     Поэтому сюда просто выводим инструкцию, а не пытаемся патчить
-#     контейнер на лету — это гарантированно не сработает.
+# 9. OOM-ПРИОРИТЕТ (docker update --oom-score-adj не существует —
+#    значение задаётся только при создании контейнера / в compose)
 # ─────────────────────────────────────────────
 COMPOSE_FILE="/opt/remnanode/docker-compose.yml"
-echo "[*] OOM-приоритет: требует правки docker-compose.yml, не применяется на лету"
-
+echo "[*] OOM-приоритет: правится только в docker-compose.yml"
 if [ -f "$COMPOSE_FILE" ]; then
     if grep -q "oom_score_adj" "$COMPOSE_FILE"; then
-        echo "    [~] oom_score_adj уже прописан в $COMPOSE_FILE"
+        skip "oom_score_adj уже прописан в $COMPOSE_FILE"
     else
-        echo "    [!] Добавь вручную в x-common якорь в $COMPOSE_FILE:"
+        warn "Добавь вручную в сервис remnanode в $COMPOSE_FILE:"
         echo "          oom_score_adj: -500"
         echo "        затем: cd /opt/remnanode && docker compose up -d --force-recreate"
     fi
 else
-    echo "    [~] $COMPOSE_FILE не найден — пропущено, поправь путь при необходимости"
+    skip "$COMPOSE_FILE не найден — пропущено"
 fi
 
 # ─────────────────────────────────────────────
 # ИТОГ
 # ─────────────────────────────────────────────
+SWAP_TOTAL=$(free -m | awk '/^Swap:/{print $2}')
+CT_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "n/a")
+
 echo ""
 echo "========================================"
 echo "   ОПТИМИЗАЦИЯ ВЫПОЛНЕНА"
 echo "========================================"
 printf "  %-22s: %s\n" "RAM профиль"    "$RAM_TIER (${TOTAL_RAM_MB}MB)"
 printf "  %-22s: %s\n" "CPU профиль"    "$CPU_TIER"
-printf "  %-22s: %s\n" "TCP CC"         "$TCP_CC"
-printf "  %-22s: %s\n" "Conntrack max"  "$CONNTRACK"
+printf "  %-22s: %s\n" "TCP CC (факт)"  "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+printf "  %-22s: %s\n" "Conntrack"      "${CT_COUNT} / ${CONNTRACK}"
 printf "  %-22s: %s\n" "Буферы (max)"   "$(( BUFF_MAX / 1024 / 1024 ))MB"
-printf "  %-22s: %s\n" "RPS/RFS"        "$([ "$RPS_ENABLED" -eq 1 ] && echo "Вкл" || echo "Откл (1 ядро)")"
-printf "  %-22s: %s\n" "THP"            "$([ "$THP_APPLIED" -eq 1 ] && echo "отключён" || echo "не найден")"
-printf "  %-22s: %s\n" "IPv6"           "Отключён"
-printf "  %-22s: %s\n" "Swap"           "1GB"
+printf "  %-22s: %s\n" "THP"            "$([ "$THP_APPLIED" -eq 1 ] && echo "отключён" || echo "не изменён")"
+printf "  %-22s: %s\n" "IPv6 (sysctl)"  "$([ "$DISABLE_IPV6" = "1" ] && echo "отключён" || echo "не тронут")"
+printf "  %-22s: %s\n" "Swap (всего)"   "${SWAP_TOTAL}MB"
 echo "========================================"
 echo ""
-echo "  Проверь после ребута:"
-echo "    sysctl net.ipv4.tcp_congestion_control"
-echo "    sysctl net.core.rmem_max"
+echo "  Проверка:"
+echo "    sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.core.rmem_max"
+echo "    swapon --show"
+echo "    cat /proc/sys/net/netfilter/nf_conntrack_count   # следи при росте нагрузки"
 echo "    docker inspect remnanode | grep -i oom"
 echo ""
+echo "  Бэкап прежних sysctl: $BACKUP"
 echo "  Рекомендуется перезагрузка: sudo reboot"
 echo ""
